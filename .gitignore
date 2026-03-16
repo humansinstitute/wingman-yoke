@@ -1,0 +1,16 @@
+node_modules
+.DS_Store
+*.log
+
+# data / runtime
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# secrets
+.env
+.env.*
+
+# build output
+dist/
