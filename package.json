@@ -1,10 +1,10 @@
 {
-  "name": "wingman-autopilot",
-  "version": "0.1.0",
-  "description": "Agent-first CLI for Coworker v4 / SuperBased workspaces",
+  "name": "wingman-yoke",
+  "version": "0.2.0",
+  "description": "Wingman-Yoke CLI for Coworker v4 / SuperBased workspaces",
   "type": "module",
   "bin": {
-    "wingman-autopilot": "./src/cli.js"
+    "wingman-yoke": "src/cli.js"
   },
   "scripts": {
     "start": "node src/cli.js",

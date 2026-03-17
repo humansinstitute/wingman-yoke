@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "wingman-autopilot",
+      "name": "wingman-yoke",
       "dependencies": {
         "better-sqlite3": "^11.8.1",
         "commander": "^13.1.0",

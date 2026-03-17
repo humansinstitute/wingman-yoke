@@ -1,4 +1,4 @@
-import { decryptFromNpub, encodeNsec, encryptForNpub } from './nostr.js';
+import { decryptFromNpub, encryptForNpub } from './nostr.js';
 
 function parseCiphertextEnvelope(value) {
   if (typeof value !== 'string') return null;
@@ -18,15 +18,44 @@ function parsePayloadJson(value) {
   return JSON.parse(value);
 }
 
+function normalizeGroupRef(value) {
+  const ref = String(value || '').trim();
+  return ref || null;
+}
+
+function normalizeKeyVersion(value) {
+  return Number.isInteger(value) ? value : null;
+}
+
+function latestKeyEntry(keyring) {
+  let latest = null;
+  for (const entry of keyring.values()) {
+    if (!latest || (entry.keyVersion ?? 0) > (latest.keyVersion ?? 0)) latest = entry;
+  }
+  return latest;
+}
+
+function resolveGroupPayloadId(payload) {
+  return normalizeGroupRef(payload?.group_id) || normalizeGroupRef(payload?.group_npub);
+}
+
+function collectGroupIds(groupPayloads = []) {
+  return [...new Set(groupPayloads.map((payload) => resolveGroupPayloadId(payload)).filter(Boolean))];
+}
+
 function normalizeShares(dataShares = [], groupPayloads = []) {
   if (Array.isArray(dataShares) && dataShares.length > 0) {
     return dataShares.map((share) => ({
       type: share.type === 'person' ? 'person' : 'group',
-      key: share.key ?? (share.type === 'person' ? share.person_npub : share.group_npub),
+      key: share.type === 'person'
+        ? (share.key ?? share.person_npub)
+        : (share.group_id ?? share.group_npub),
       access: share.access === 'write' ? 'write' : 'read',
       label: share.label ?? '',
       person_npub: share.person_npub ?? null,
+      group_id: share.group_id ?? share.group_npub ?? null,
       group_npub: share.group_npub ?? null,
+      via_group_id: share.via_group_id ?? share.via_group_npub ?? null,
       via_group_npub: share.via_group_npub ?? null,
       inherited: share.inherited === true,
       inherited_from_directory_id: share.inherited_from_directory_id ?? null,
@@ -35,11 +64,14 @@ function normalizeShares(dataShares = [], groupPayloads = []) {
 
   return groupPayloads.map((payload) => ({
     type: 'group',
-    key: payload.group_npub,
+    key: payload.group_id ?? payload.group_npub,
     access: payload.write ? 'write' : 'read',
     label: '',
     person_npub: null,
+    group_id: payload.group_id ?? payload.group_npub ?? null,
+    group_epoch: payload.group_epoch ?? null,
     group_npub: payload.group_npub,
+    via_group_id: null,
     via_group_npub: null,
     inherited: false,
     inherited_from_directory_id: null,
@@ -53,26 +85,63 @@ export function recordFamilyHash(appNpub, collectionSpace) {
 export function unwrapGroupKey(session, keyRow) {
   const nsec = decryptFromNpub(session.secret, keyRow.wrapped_by_npub, keyRow.wrapped_group_nsec);
   return {
+    groupId: keyRow.group_id ?? keyRow.group_npub,
     groupNpub: keyRow.group_npub,
-    keyVersion: keyRow.key_version ?? 1,
+    keyVersion: keyRow.key_version ?? keyRow.epoch ?? 1,
     nsec,
     secret: session.constructor?.decodeNsec ? session.constructor.decodeNsec(nsec) : null,
   };
 }
 
 export function loadGroupKeyMap(session, keyRows, decodeNsec) {
-  const map = new Map();
+  const byId = new Map();
+  const byNpub = new Map();
   for (const row of keyRows) {
     const nsec = decryptFromNpub(session.secret, row.wrapped_by_npub, row.wrapped_group_nsec);
-    map.set(row.group_npub, {
+    const entry = {
       groupNpub: row.group_npub,
-      groupId: row.group_id,
-      keyVersion: row.key_version ?? 1,
+      groupId: row.group_id ?? row.group_npub,
+      keyVersion: row.key_version ?? row.epoch ?? 1,
       nsec,
       secret: decodeNsec(nsec),
-    });
+    };
+    byNpub.set(entry.groupNpub, entry);
+    const keyring = byId.get(entry.groupId) ?? new Map();
+    keyring.set(entry.keyVersion, entry);
+    byId.set(entry.groupId, keyring);
   }
-  return map;
+
+  const get = (groupRef, options = {}) => {
+    const ref = normalizeGroupRef(groupRef);
+    if (!ref) return null;
+    const keyVersion = normalizeKeyVersion(options.keyVersion);
+    const keyring = byId.get(ref);
+    if (keyring?.size) {
+      if (keyVersion != null && keyring.has(keyVersion)) return keyring.get(keyVersion) ?? null;
+      return latestKeyEntry(keyring);
+    }
+    return byNpub.get(ref) ?? null;
+  };
+
+  return {
+    byId,
+    byNpub,
+    get,
+    getCurrent(groupRef) {
+      return get(groupRef);
+    },
+    has(groupRef, options = {}) {
+      return Boolean(get(groupRef, options));
+    },
+    resolveGroupId(groupRef) {
+      return get(groupRef)?.groupId ?? normalizeGroupRef(groupRef);
+    },
+    resolveGroupNpub(groupRef) {
+      const ref = normalizeGroupRef(groupRef);
+      if (!ref) return null;
+      return get(groupRef)?.groupNpub ?? (byNpub.has(ref) ? ref : null);
+    },
+  };
 }
 
 export function decryptRecordPayload(record, session, groupKeys) {
@@ -82,8 +151,10 @@ export function decryptRecordPayload(record, session, groupKeys) {
   }
 
   for (const payload of (record.group_payloads || [])) {
-    const keyEntry = groupKeys.get(payload.group_npub);
-    if (!keyEntry) continue;
+    const keyVersion = normalizeKeyVersion(payload.group_epoch);
+    const keyEntry = groupKeys.get(payload.group_id, { keyVersion })
+      || groupKeys.get(payload.group_npub);
+    if (!keyEntry?.secret) continue;
     const envelope = parseCiphertextEnvelope(payload.ciphertext);
     const senderNpub = envelope?.encrypted_by_npub || record.signature_npub || payload.group_npub;
     const ciphertext = envelope?.ciphertext || payload.ciphertext;
@@ -98,9 +169,12 @@ function normalizeRecordState(data) {
 }
 
 export function inboundGroup(group) {
+  const currentGroupNpub = group.current_group_npub ?? group.group_npub ?? group.id;
   return {
-    group_npub: group.group_npub ?? group.id,
+    group_npub: currentGroupNpub,
+    current_group_npub: currentGroupNpub,
     group_id: group.id ?? group.group_id ?? group.group_npub,
+    current_epoch: Number(group.current_epoch || 1),
     owner_npub: group.owner_npub,
     name: group.name ?? '',
     group_kind: group.group_kind || 'shared',
@@ -115,7 +189,7 @@ export function inboundChannel(record, payload) {
     record_id: record.record_id,
     owner_npub: record.owner_npub,
     title: data.title ?? '',
-    group_ids: (record.group_payloads || []).map((gp) => gp.group_npub),
+    group_ids: collectGroupIds(record.group_payloads || []),
     participant_npubs: Array.isArray(data.participant_npubs) ? data.participant_npubs : [record.owner_npub],
     scope_id: data.scope_id ?? null,
     scope_product_id: data.scope_product_id ?? null,
@@ -152,12 +226,13 @@ export function inboundTask(record, payload) {
     description: data.description ?? '',
     state: data.state ?? 'new',
     priority: data.priority ?? 'sand',
+    assigned_to_npub: data.assigned_to_npub ?? null,
     parent_task_id: data.parent_task_id ?? null,
     board_group_id: data.board_group_id ?? null,
     scheduled_for: data.scheduled_for ?? null,
     tags: data.tags ?? '',
-    shares: data.shares ?? [],
-    group_ids: (record.group_payloads || []).map((gp) => gp.group_npub),
+    shares: normalizeShares(data.shares, record.group_payloads || []),
+    group_ids: collectGroupIds(record.group_payloads || []),
     record_state: normalizeRecordState(data),
     version: record.version ?? 1,
     updated_at: record.updated_at ?? new Date().toISOString(),
@@ -191,7 +266,7 @@ export function inboundDirectory(record, payload) {
     title: data.title ?? 'Untitled directory',
     parent_directory_id: data.parent_directory_id ?? null,
     shares: normalizeShares(data.shares, record.group_payloads || []),
-    group_ids: (record.group_payloads || []).map((gp) => gp.group_npub),
+    group_ids: collectGroupIds(record.group_payloads || []),
     record_state: normalizeRecordState(data),
     version: record.version ?? 1,
     updated_at: record.updated_at ?? new Date().toISOString(),
@@ -207,7 +282,7 @@ export function inboundDocument(record, payload) {
     content: data.content ?? '',
     parent_directory_id: data.parent_directory_id ?? null,
     shares: normalizeShares(data.shares, record.group_payloads || []),
-    group_ids: (record.group_payloads || []).map((gp) => gp.group_npub),
+    group_ids: collectGroupIds(record.group_payloads || []),
     record_state: normalizeRecordState(data),
     version: record.version ?? 1,
     updated_at: record.updated_at ?? new Date().toISOString(),
@@ -233,7 +308,7 @@ export function inboundAudioNote(record, payload) {
     transcript: data.transcript ?? null,
     summary: data.summary ?? null,
     sender_npub: record.signature_npub ?? record.owner_npub,
-    group_ids: (record.group_payloads || []).map((gp) => gp.group_npub),
+    group_ids: collectGroupIds(record.group_payloads || []),
     record_state: normalizeRecordState(data),
     version: record.version ?? 1,
     updated_at: record.updated_at ?? new Date().toISOString(),
@@ -257,14 +332,88 @@ export function inboundScope(record, payload) {
   };
 }
 
-export function makeGroupWriteShare(groupNpub, label = '') {
+export function inboundSchedule(record, payload) {
+  const data = payload.data ?? payload;
+  const rawDays = data.days ?? data.days_json ?? [];
+  const days = Array.isArray(rawDays) ? rawDays : (typeof rawDays === 'string' ? rawDays.split(',').map((d) => d.trim()).filter(Boolean) : []);
+  return {
+    record_id: record.record_id,
+    owner_npub: record.owner_npub,
+    title: data.title ?? '',
+    description: data.description ?? '',
+    time_start: data.time_start ?? null,
+    time_end: data.time_end ?? null,
+    days,
+    timezone: data.timezone ?? 'Australia/Perth',
+    assigned_group_id: data.assigned_group_id ?? data.assigned_to_npub ?? null,
+    active: data.active === true || data.active === 1,
+    last_run: data.last_run ?? null,
+    repeat: data.repeat ?? 'daily',
+    shares: normalizeShares(data.shares, record.group_payloads || []),
+    group_ids: collectGroupIds(record.group_payloads || []),
+    record_state: normalizeRecordState(data),
+    version: record.version ?? 1,
+    updated_at: record.updated_at ?? new Date().toISOString(),
+  };
+}
+
+export function outboundSchedule(appNpub, session, groupKeys, schedule, patch = {}) {
+  const next = { ...schedule, ...patch };
+  const payload = {
+    app_namespace: appNpub,
+    collection_space: 'schedule',
+    schema_version: 1,
+    record_id: schedule.record_id,
+    data: {
+      title: next.title,
+      description: next.description ?? '',
+      time_start: next.time_start ?? null,
+      time_end: next.time_end ?? null,
+      days: Array.isArray(next.days) ? next.days : [],
+      timezone: next.timezone ?? 'Australia/Perth',
+      assigned_group_id: next.assigned_group_id ?? null,
+      active: next.active === true || next.active === 1,
+      last_run: next.last_run ?? null,
+      repeat: next.repeat ?? 'daily',
+      shares: next.shares ?? [],
+      record_state: next.record_state ?? 'active',
+    },
+  };
+  const plaintext = JSON.stringify(payload);
+  const writeGroup = resolveWriteGroupMetadata(
+    groupKeys,
+    resolveWriteGroup(session, groupKeys, next, next.assigned_group_id ?? next.board_group_id)
+  );
+  return {
+    record_id: schedule.record_id,
+    owner_npub: schedule.owner_npub,
+    record_family_hash: recordFamilyHash(appNpub, 'schedule'),
+    version: (schedule.version ?? 1) + 1,
+    previous_version: schedule.version ?? 1,
+    signature_npub: session.npub,
+    write_group_id: writeGroup.groupId || undefined,
+    write_group_npub: writeGroup.groupNpub || undefined,
+    owner_payload: encryptOwnerPayload(schedule.owner_npub, plaintext, session),
+    group_payloads: buildGroupPayloads(next.group_ids || [], plaintext, session, groupKeys),
+  };
+}
+
+export function makeGroupWriteShare(groupRef, label = '') {
+  const groupId = typeof groupRef === 'object'
+    ? normalizeGroupRef(groupRef.group_id ?? groupRef.groupId ?? groupRef.id)
+    : normalizeGroupRef(groupRef);
+  const groupNpub = typeof groupRef === 'object'
+    ? normalizeGroupRef(groupRef.current_group_npub ?? groupRef.group_npub ?? groupRef.groupNpub)
+    : null;
   return {
     type: 'group',
-    key: groupNpub,
+    key: groupId || groupNpub,
     access: 'write',
     label,
     person_npub: null,
+    group_id: groupId || groupNpub,
     group_npub: groupNpub,
+    via_group_id: null,
     via_group_npub: null,
     inherited: false,
     inherited_from_directory_id: null,
@@ -275,38 +424,69 @@ export function encryptOwnerPayload(ownerNpub, plaintext, session) {
   return { ciphertext: encryptForNpub(session.secret, ownerNpub, plaintext) };
 }
 
-function buildGroupPayloads(groupIds, plaintext, session, canWriteMap = null) {
-  const uniqueGroups = [...new Set((groupIds || []).map((value) => String(value || '').trim()).filter(Boolean))];
-  return uniqueGroups.map((groupNpub) => ({
-    group_npub: groupNpub,
+function buildGroupPayloads(groupIds, plaintext, session, groupKeys, canWriteMap = null) {
+  const uniqueGroups = new Map();
+  for (const value of (groupIds || [])) {
+    const ref = normalizeGroupRef(value);
+    if (!ref) continue;
+    const keyEntry = groupKeys.get(ref);
+    if (!keyEntry?.groupNpub) {
+      throw new Error(`No group key loaded for ${ref}`);
+    }
+    const stableGroupId = keyEntry.groupId || ref;
+    if (!uniqueGroups.has(stableGroupId)) uniqueGroups.set(stableGroupId, keyEntry);
+  }
+
+  return [...uniqueGroups.entries()].map(([stableGroupId, keyEntry]) => ({
+    group_id: keyEntry.groupId || stableGroupId,
+    group_epoch: keyEntry.keyVersion || undefined,
+    group_npub: keyEntry.groupNpub,
     ciphertext: JSON.stringify({
       encrypted_by_npub: session.npub,
-      ciphertext: encryptForNpub(session.secret, groupNpub, plaintext),
+      ciphertext: encryptForNpub(session.secret, keyEntry.groupNpub, plaintext),
     }),
-    write: canWriteMap instanceof Map ? canWriteMap.get(groupNpub) === true : true,
+    write: canWriteMap instanceof Map
+      ? (canWriteMap.get(stableGroupId) === true || canWriteMap.get(keyEntry.groupNpub) === true)
+      : true,
   }));
 }
 
-function selectWriteGroup(session, resource, fallbackGroupId = null) {
-  const explicit = String(fallbackGroupId || '').trim();
+function resolveWriteGroup(session, groupKeys, resource, fallbackGroupId = null) {
+  const resolveGroupId = (groupRef) => groupKeys.resolveGroupId(groupRef);
+  const explicit = resolveGroupId(fallbackGroupId);
   if (explicit) return explicit;
   const shares = Array.isArray(resource?.shares) ? resource.shares : [];
   const directPersonShare = shares.find((share) => (
     share?.person_npub === session.npub
     && share?.access === 'write'
-    && typeof share?.via_group_npub === 'string'
-    && share.via_group_npub.trim()
+    && (
+      normalizeGroupRef(share?.via_group_id)
+      || normalizeGroupRef(share?.via_group_npub)
+    )
   ));
-  if (directPersonShare?.via_group_npub) return directPersonShare.via_group_npub;
+  if (directPersonShare?.via_group_id || directPersonShare?.via_group_npub) {
+    return resolveGroupId(directPersonShare.via_group_id ?? directPersonShare.via_group_npub);
+  }
   const writableGroupShare = shares.find((share) => (
-    share?.group_npub
+    normalizeGroupRef(share?.group_id ?? share?.group_npub)
     && share?.access === 'write'
   ));
-  if (writableGroupShare?.group_npub) return writableGroupShare.group_npub;
-  return resource?.group_ids?.find(Boolean) || undefined;
+  if (writableGroupShare?.group_id || writableGroupShare?.group_npub) {
+    return resolveGroupId(writableGroupShare.group_id ?? writableGroupShare.group_npub);
+  }
+  return resolveGroupId(resource?.group_ids?.find(Boolean));
 }
 
-export function outboundChatMessage(appNpub, session, channel, {
+function resolveWriteGroupMetadata(groupKeys, groupId) {
+  const resolvedGroupId = groupKeys.resolveGroupId(groupId);
+  if (!resolvedGroupId) return { groupId: null, groupNpub: null };
+  return {
+    groupId: resolvedGroupId,
+    groupNpub: groupKeys.resolveGroupNpub(resolvedGroupId),
+  };
+}
+
+export function outboundChatMessage(appNpub, session, groupKeys, channel, {
   recordId,
   body,
   parentMessageId = null,
@@ -329,6 +509,7 @@ export function outboundChatMessage(appNpub, session, channel, {
     },
   };
   const plaintext = JSON.stringify(payload);
+  const writeGroup = resolveWriteGroupMetadata(groupKeys, resolveWriteGroup(session, groupKeys, channel));
   return {
     record_id: recordId,
     owner_npub: channel.owner_npub,
@@ -336,13 +517,14 @@ export function outboundChatMessage(appNpub, session, channel, {
     version,
     previous_version: previousVersion,
     signature_npub: session.npub,
-    write_group_npub: selectWriteGroup(session, channel),
+    write_group_id: writeGroup.groupId || undefined,
+    write_group_npub: writeGroup.groupNpub || undefined,
     owner_payload: encryptOwnerPayload(channel.owner_npub, plaintext, session),
-    group_payloads: buildGroupPayloads(channel.group_ids || [], plaintext, session),
+    group_payloads: buildGroupPayloads(channel.group_ids || [], plaintext, session, groupKeys),
   };
 }
 
-export function outboundChannel(appNpub, session, {
+export function outboundChannel(appNpub, session, groupKeys, {
   recordId,
   ownerNpub,
   title,
@@ -373,6 +555,10 @@ export function outboundChannel(appNpub, session, {
     },
   };
   const plaintext = JSON.stringify(payload);
+  const writeGroup = resolveWriteGroupMetadata(
+    groupKeys,
+    writeGroupNpub || resolveWriteGroup(session, groupKeys, { group_ids: groupIds })
+  );
   return {
     record_id: recordId,
     owner_npub: ownerNpub,
@@ -380,13 +566,14 @@ export function outboundChannel(appNpub, session, {
     version,
     previous_version: previousVersion,
     signature_npub: session.npub,
-    write_group_npub: writeGroupNpub || selectWriteGroup(session, { group_ids: groupIds }),
+    write_group_id: writeGroup.groupId || undefined,
+    write_group_npub: writeGroup.groupNpub || undefined,
     owner_payload: encryptOwnerPayload(ownerNpub, plaintext, session),
-    group_payloads: buildGroupPayloads(groupIds || [], plaintext, session),
+    group_payloads: buildGroupPayloads(groupIds || [], plaintext, session, groupKeys),
   };
 }
 
-export function outboundTask(appNpub, session, task, patch = {}) {
+export function outboundTask(appNpub, session, groupKeys, task, patch = {}) {
   const next = { ...task, ...patch };
   const payload = {
     app_namespace: appNpub,
@@ -398,6 +585,7 @@ export function outboundTask(appNpub, session, task, patch = {}) {
       description: next.description ?? '',
       state: next.state ?? 'new',
       priority: next.priority ?? 'sand',
+      assigned_to_npub: next.assigned_to_npub ?? null,
       parent_task_id: next.parent_task_id ?? null,
       board_group_id: next.board_group_id ?? null,
       scheduled_for: next.scheduled_for ?? null,
@@ -407,6 +595,10 @@ export function outboundTask(appNpub, session, task, patch = {}) {
     },
   };
   const plaintext = JSON.stringify(payload);
+  const writeGroup = resolveWriteGroupMetadata(
+    groupKeys,
+    resolveWriteGroup(session, groupKeys, next, next.board_group_id)
+  );
   return {
     record_id: task.record_id,
     owner_npub: task.owner_npub,
@@ -414,13 +606,14 @@ export function outboundTask(appNpub, session, task, patch = {}) {
     version: (task.version ?? 1) + 1,
     previous_version: task.version ?? 1,
     signature_npub: session.npub,
-    write_group_npub: selectWriteGroup(session, next, next.board_group_id),
+    write_group_id: writeGroup.groupId || undefined,
+    write_group_npub: writeGroup.groupNpub || undefined,
     owner_payload: encryptOwnerPayload(task.owner_npub, plaintext, session),
-    group_payloads: buildGroupPayloads(next.group_ids || [], plaintext, session),
+    group_payloads: buildGroupPayloads(next.group_ids || [], plaintext, session, groupKeys),
   };
 }
 
-export function outboundComment(appNpub, session, target, {
+export function outboundComment(appNpub, session, groupKeys, target, {
   recordId,
   body,
   parentCommentId = null,
@@ -451,6 +644,10 @@ export function outboundComment(appNpub, session, target, {
     },
   };
   const plaintext = JSON.stringify(payload);
+  const writeGroup = resolveWriteGroupMetadata(
+    groupKeys,
+    resolveWriteGroup(session, groupKeys, target, target.board_group_id)
+  );
   return {
     record_id: recordId,
     owner_npub: target.owner_npub,
@@ -458,13 +655,14 @@ export function outboundComment(appNpub, session, target, {
     version,
     previous_version: previousVersion,
     signature_npub: session.npub,
-    write_group_npub: selectWriteGroup(session, target, target.board_group_id),
+    write_group_id: writeGroup.groupId || undefined,
+    write_group_npub: writeGroup.groupNpub || undefined,
     owner_payload: encryptOwnerPayload(target.owner_npub, plaintext, session),
-    group_payloads: buildGroupPayloads(target.group_ids || [], plaintext, session),
+    group_payloads: buildGroupPayloads(target.group_ids || [], plaintext, session, groupKeys),
   };
 }
 
-export function outboundDocument(appNpub, session, document, patch = {}) {
+export function outboundDocument(appNpub, session, groupKeys, document, patch = {}) {
   const next = { ...document, ...patch };
   const payload = {
     app_namespace: appNpub,
@@ -480,6 +678,7 @@ export function outboundDocument(appNpub, session, document, patch = {}) {
     },
   };
   const plaintext = JSON.stringify(payload);
+  const writeGroup = resolveWriteGroupMetadata(groupKeys, resolveWriteGroup(session, groupKeys, next));
   return {
     record_id: document.record_id,
     owner_npub: document.owner_npub,
@@ -487,13 +686,14 @@ export function outboundDocument(appNpub, session, document, patch = {}) {
     version: (document.version ?? 1) + 1,
     previous_version: document.version ?? 1,
     signature_npub: session.npub,
-    write_group_npub: selectWriteGroup(session, next),
+    write_group_id: writeGroup.groupId || undefined,
+    write_group_npub: writeGroup.groupNpub || undefined,
     owner_payload: encryptOwnerPayload(document.owner_npub, plaintext, session),
-    group_payloads: buildGroupPayloads(next.group_ids || [], plaintext, session),
+    group_payloads: buildGroupPayloads(next.group_ids || [], plaintext, session, groupKeys),
   };
 }
 
-export function outboundAudioNote(appNpub, session, {
+export function outboundAudioNote(appNpub, session, groupKeys, {
   recordId,
   ownerNpub,
   targetRecordId = null,
@@ -538,6 +738,10 @@ export function outboundAudioNote(appNpub, session, {
     },
   };
   const plaintext = JSON.stringify(payload);
+  const writeGroup = resolveWriteGroupMetadata(
+    groupKeys,
+    writeGroupNpub || resolveWriteGroup(session, groupKeys, { group_ids: targetGroupIds })
+  );
   return {
     record_id: recordId,
     owner_npub: ownerNpub,
@@ -545,8 +749,9 @@ export function outboundAudioNote(appNpub, session, {
     version,
     previous_version: previousVersion,
     signature_npub: session.npub,
-    write_group_npub: writeGroupNpub || selectWriteGroup(session, { group_ids: targetGroupIds }),
+    write_group_id: writeGroup.groupId || undefined,
+    write_group_npub: writeGroup.groupNpub || undefined,
     owner_payload: encryptOwnerPayload(ownerNpub, plaintext, session),
-    group_payloads: buildGroupPayloads(targetGroupIds || [], plaintext, session),
+    group_payloads: buildGroupPayloads(targetGroupIds || [], plaintext, session, groupKeys),
   };
 }

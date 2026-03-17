@@ -11,17 +11,22 @@ export class SuperbasedClient {
     return new URL(pathname, this.config.directHttpsUrl).toString();
   }
 
-  async request(pathname, { method = 'GET', body = null, authHeader = null } = {}) {
+  async requestRaw(pathname, { method = 'GET', body = null, authHeader = null, headers = {} } = {}) {
     const url = this.url(pathname);
     const authorization = authHeader || createNip98AuthHeader(url, method, body, this.session.secret);
-    const response = await fetch(url, {
+    return fetch(url, {
       method,
       headers: {
         Authorization: authorization,
         ...(body != null ? { 'Content-Type': 'application/json' } : {}),
+        ...headers,
       },
       body: body != null ? JSON.stringify(body) : undefined,
     });
+  }
+
+  async request(pathname, options = {}) {
+    const response = await this.requestRaw(pathname, options);
     if (!response.ok) {
       const text = await response.text().catch(() => '');
       throw new Error(`API ${response.status}: ${text}`);
@@ -54,11 +59,13 @@ export class SuperbasedClient {
     };
     const groupWriteTokens = {};
     for (const record of records) {
-      const groupNpub = String(record.write_group_npub || '').trim();
-      if (!groupNpub || groupWriteTokens[groupNpub]) continue;
-      const keyEntry = this.groupKeys.get(groupNpub);
-      if (!keyEntry?.secret) throw new Error(`Missing local group key for ${groupNpub}`);
-      groupWriteTokens[groupNpub] = createNip98AuthHeader(this.url('/api/v4/records/sync'), 'POST', proofBody, keyEntry.secret);
+      const groupRef = String(record.write_group_id || record.write_group_npub || '').trim();
+      if (!groupRef || groupWriteTokens[groupRef]) continue;
+      const keyEntry = this.groupKeys.getCurrent
+        ? this.groupKeys.getCurrent(groupRef)
+        : this.groupKeys.get(groupRef);
+      if (!keyEntry?.secret) throw new Error(`Missing local group key for ${groupRef}`);
+      groupWriteTokens[groupRef] = createNip98AuthHeader(this.url('/api/v4/records/sync'), 'POST', proofBody, keyEntry.secret);
     }
     return this.request('/api/v4/records/sync', {
       method: 'POST',
@@ -71,6 +78,23 @@ export class SuperbasedClient {
 
   getStorageDownloadUrl(objectId) {
     return this.request(`/api/v4/storage/${objectId}/download-url`);
+  }
+
+  getStorageObject(objectId) {
+    return this.request(`/api/v4/storage/${objectId}`);
+  }
+
+  getStorageContentUrl(objectId) {
+    return this.url(`/api/v4/storage/${objectId}/content`);
+  }
+
+  async getStorageContent(objectId) {
+    const response = await this.requestRaw(`/api/v4/storage/${objectId}/content`);
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`API ${response.status}: ${text}`);
+    }
+    return new Uint8Array(await response.arrayBuffer());
   }
 
   prepareStorageObject(body) {

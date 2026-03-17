@@ -16,7 +16,8 @@ function loadNsecFromBitwarden() {
 }
 
 export function getConfiguredNsec() {
-  return process.env.WINGMAN_AUTOPILOT_NSEC
+  return process.env.WINGMAN_YOKE_NSEC
+    || process.env.WINGMAN_AUTOPILOT_NSEC
     || process.env.NOSTR_NSEC
     || loadNsecFromBitwarden();
 }

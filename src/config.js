@@ -4,10 +4,24 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { parseConnectionToken } from './token.js';
 
-export function getStateDir() {
-  const override = String(process.env.WINGMAN_AP_STATE_DIR || '').trim();
-  if (override) return override;
+function getDefaultStateDir() {
+  return path.join(os.homedir(), '.wingman-yoke');
+}
+
+function getLegacyStateDir() {
   return path.join(os.homedir(), '.wingman-ap');
+}
+
+export function getStateDir() {
+  const override = String(process.env.WINGMAN_YOKE_STATE_DIR || '').trim();
+  if (override) return override;
+  const legacyOverride = String(process.env.WINGMAN_AP_STATE_DIR || '').trim();
+  if (legacyOverride) return legacyOverride;
+  const defaultDir = getDefaultStateDir();
+  if (fs.existsSync(defaultDir)) return defaultDir;
+  const legacyDir = getLegacyStateDir();
+  if (fs.existsSync(legacyDir)) return legacyDir;
+  return defaultDir;
 }
 
 export function getConfigPath() {
@@ -15,7 +29,12 @@ export function getConfigPath() {
 }
 
 export function getDbPath() {
-  return path.join(getStateDir(), 'autopilot.db');
+  const stateDir = getStateDir();
+  const preferredPath = path.join(stateDir, 'yoke.db');
+  if (fs.existsSync(preferredPath)) return preferredPath;
+  const legacyPath = path.join(stateDir, 'autopilot.db');
+  if (fs.existsSync(legacyPath)) return legacyPath;
+  return preferredPath;
 }
 
 export function ensureStateDir() {

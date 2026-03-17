@@ -13,10 +13,15 @@ export async function resolveStorageLinks(client, text) {
   const resolved = [];
   for (const objectId of objectIds) {
     try {
-      const result = await client.getStorageDownloadUrl(objectId);
+      const storageObject = await client.getStorageObject(objectId);
       resolved.push({
         object_id: objectId,
-        download_url: result.download_url,
+        file_name: storageObject.file_name || null,
+        content_type: storageObject.content_type || null,
+        size_bytes: storageObject.size_bytes ?? null,
+        content_url: storageObject.content_url || client.getStorageContentUrl(objectId),
+        download_url: storageObject.download_url || null,
+        completed_at: storageObject.completed_at || null,
       });
     } catch (error) {
       resolved.push({

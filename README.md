@@ -1,45 +1,58 @@
-# wm-autopilot
+# Wingman-Yoke
 
-Agent-first CLI for Coworker v4 / SuperBased workspaces.
+Wingman-Yoke is the CLI that the autopilot agent uses when it needs to steer Coworker workspaces through SuperBased.
 
-State lives in:
+## State
 
-- `~/.wingman-ap/autopilot.db`
-- `~/.wingman-ap/config.json` fallback mirror of the active connection config
+By default, state lives in:
 
-Bootstrap:
+- `~/.wingman-yoke/yoke.db`
+- `~/.wingman-yoke/config.json`
+
+Compatibility fallbacks are still supported for older installs:
+
+- `WINGMAN_AP_STATE_DIR`
+- `WINGMAN_AUTOPILOT_NSEC`
+- legacy `autopilot.db` files
+
+Preferred environment variables:
+
+- `WINGMAN_YOKE_STATE_DIR`
+- `WINGMAN_YOKE_NSEC`
+
+## Bootstrap
+
+From the repository root:
 
 ```bash
-export WINGMAN_AUTOPILOT_NSEC=...
-cd ~/code/superbased/coworker/wm-autopilot
 bun install
+export WINGMAN_YOKE_NSEC=...
 node src/cli.js init --token "<connection_token>"
 node src/cli.js sync
 ```
 
-You can also pass the full Agent Connect JSON package to `init --token`; the CLI
-will extract `.connection_token` automatically.
+You can also pass the full Agent Connect JSON package to `init --token`; Wingman-Yoke will extract `.connection_token` automatically.
 
-Local execution during development:
+## Development
 
 ```bash
-cd ~/code/superbased/coworker/wm-autopilot
 bun run start -- status
 node src/cli.js sync
 ```
 
-Once published, the intended entrypoints are:
+Published entrypoints:
 
 ```bash
-npx wingman-autopilot status
-bunx wingman-autopilot status
+npx wingman-yoke status
+bunx wingman-yoke status
 ```
 
-Example commands:
+## Example Commands
 
 ```bash
 node src/cli.js status
 node src/cli.js getLatest
+
 node src/cli.js tasks list
 node src/cli.js tasks create --title "New task"
 node src/cli.js tasks update <task-id> --state in_progress
@@ -49,7 +62,7 @@ node src/cli.js tasks comment-image <task-id> --file ./image.png --body "See thi
 node src/cli.js tasks voice <task-id> --file ./voice.aiff --body "Voice note"
 
 node src/cli.js chat channels
-node src/cli.js chat create --title "WM21 temp"
+node src/cli.js chat create --title "Yoke temp"
 node src/cli.js chat messages <channel-id>
 node src/cli.js chat send <channel-id> --body "Hello"
 node src/cli.js chat reply <channel-id> --thread <message-id> --body "Reply"
@@ -71,9 +84,8 @@ node src/cli.js audio show <audio-note-id>
 node src/cli.js audio update-transcript <audio-note-id> --transcript "Transcript text"
 ```
 
-Tests:
+## Tests
 
 ```bash
-cd ~/code/superbased/coworker/wm-autopilot
 node --test
 ```

@@ -8,6 +8,7 @@ import {
   inboundDirectory,
   inboundDocument,
   inboundGroup,
+  inboundSchedule,
   inboundScope,
   inboundTask,
   loadGroupKeyMap,
@@ -24,6 +25,7 @@ const FAMILY_TABLES = [
   { collection: 'comment', table: 'comments', mapper: inboundComment },
   { collection: 'audio_note', table: 'audio_notes', mapper: inboundAudioNote },
   { collection: 'scope', table: 'scopes', mapper: inboundScope },
+  { collection: 'schedule', table: 'schedules', mapper: inboundSchedule },
 ];
 
 function json(value) {
@@ -69,6 +71,7 @@ function rowForTable(table, mapped, rawRecord) {
         description: mapped.description,
         state: mapped.state,
         priority: mapped.priority,
+        assigned_to_npub: mapped.assigned_to_npub,
         parent_task_id: mapped.parent_task_id,
         board_group_id: mapped.board_group_id,
         scheduled_for: mapped.scheduled_for,
@@ -163,6 +166,27 @@ function rowForTable(table, mapped, rawRecord) {
         updated_at: mapped.updated_at,
         ...common,
       };
+    case 'schedules':
+      return {
+        record_id: mapped.record_id,
+        owner_npub: mapped.owner_npub,
+        title: mapped.title,
+        description: mapped.description,
+        time_start: mapped.time_start,
+        time_end: mapped.time_end,
+        days_json: json(mapped.days),
+        timezone: mapped.timezone,
+        assigned_group_id: mapped.assigned_group_id,
+        active: mapped.active ? 1 : 0,
+        last_run: mapped.last_run,
+        repeat: mapped.repeat,
+        group_ids_json: json(mapped.group_ids),
+        shares_json: json(mapped.shares),
+        record_state: mapped.record_state,
+        version: mapped.version,
+        updated_at: mapped.updated_at,
+        ...common,
+      };
     default:
       throw new Error(`Unsupported table ${table}`);
   }
@@ -173,8 +197,9 @@ export async function syncWorkspace({ client, config, session, quiet = false }) 
   const groupsResult = await client.getGroups();
   const groups = (groupsResult.groups ?? []).map(inboundGroup);
   replaceGroups(db, groups.map((group) => ({
-    group_npub: group.group_npub,
     group_id: group.group_id,
+    current_group_npub: group.current_group_npub ?? group.group_npub ?? null,
+    current_epoch: group.current_epoch ?? 1,
     owner_npub: group.owner_npub,
     name: group.name,
     group_kind: group.group_kind,
@@ -186,9 +211,9 @@ export async function syncWorkspace({ client, config, session, quiet = false }) 
 
   const keysResult = await client.getGroupKeys();
   const keyRows = (keysResult.keys ?? []).map((entry) => ({
+    group_id: entry.group_id ?? entry.group_npub ?? null,
+    key_version: entry.key_version ?? entry.epoch ?? 1,
     group_npub: entry.group_npub,
-    group_id: entry.group_id ?? null,
-    key_version: entry.key_version ?? 1,
     wrapped_group_nsec: entry.wrapped_group_nsec,
     wrapped_by_npub: entry.wrapped_by_npub,
     raw_json: json(entry),

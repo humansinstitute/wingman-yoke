@@ -4,6 +4,7 @@ node_modules
 
 # data / runtime
 data/
+.wingman-ap/
 *.db
 *.db-wal
 *.db-shm
