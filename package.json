@@ -3,9 +3,31 @@
   "version": "0.2.0",
   "description": "Wingman-Yoke CLI for Coworker v4 / SuperBased workspaces",
   "type": "module",
+  "license": "MIT",
+  "author": "Humans Institute",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/humansinstitute/wingman-yoke.git"
+  },
+  "homepage": "https://github.com/humansinstitute/wingman-yoke#readme",
+  "bugs": {
+    "url": "https://github.com/humansinstitute/wingman-yoke/issues"
+  },
+  "keywords": [
+    "wingman",
+    "cli",
+    "coworker",
+    "superbased",
+    "nostr"
+  ],
   "bin": {
     "wingman-yoke": "src/cli.js"
   },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node src/cli.js",
     "dev": "node src/cli.js",

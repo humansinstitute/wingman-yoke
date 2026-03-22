@@ -1,0 +1,9 @@
+tests/
+.github/
+node_modules/
+*.test.js
+.npmignore
+.gitignore
+agents.md
+claude.md
+.mcp.json
