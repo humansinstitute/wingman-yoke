@@ -10,10 +10,10 @@ import { initConfigFromToken, loadConfig } from './config.js';
 import { getMeta, getRow, getRows, openDb } from './db.js';
 import { resolveStorageLinks } from './render.js';
 import { SuperbasedClient } from './client.js';
-import { decodeNsec, getSession } from './nostr.js';
+import { buildWrappedMemberKeys, createGroupIdentity, decodeNsec, getSession } from './nostr.js';
 import { createStorageMarkdown, defaultFileName, detectMimeType, uploadEncryptedAudioToStorage, uploadFileToStorage } from './storage.js';
 import { syncWorkspace } from './sync.js';
-import { loadGroupKeyMap, makeGroupWriteShare, outboundAudioNote, outboundChannel, outboundChatMessage, outboundComment, outboundDocument, outboundSchedule, outboundTask, recordFamilyHash } from './translators.js';
+import { loadGroupKeyMap, makeGroupWriteShare, outboundAudioNote, outboundChannel, outboundChatMessage, outboundComment, outboundDirectory, outboundDocument, outboundSchedule, outboundScope, outboundTask, recordFamilyHash } from './translators.js';
 
 function requireConfig() {
   const config = loadConfig();
@@ -80,13 +80,12 @@ function findGroupByRef(db, groupRef) {
   return getRow(db, `SELECT * FROM groups_cache WHERE group_id = ? OR current_group_npub = ?`, [groupRef, groupRef]);
 }
 
-function resolveStorageAccessGroupNpubs(db, groupRefs = []) {
+function resolveStorageAccessGroupIds(db, groupRefs = []) {
   return [...new Set((groupRefs || []).map((groupRef) => {
     const ref = String(groupRef || '').trim();
     if (!ref) return null;
     const row = findGroupByRef(db, ref);
-    if (row?.current_group_npub) return row.current_group_npub;
-    if (ref.startsWith('npub1')) return ref;
+    if (row?.group_id) return row.group_id;
     return null;
   }).filter(Boolean))];
 }
@@ -97,6 +96,14 @@ function buildDefaultGroupShares(group, label = '') {
 
 function findCommentRow(db, commentId) {
   return getRow(db, `SELECT * FROM comments WHERE record_id = ?`, [commentId]);
+}
+
+function findDirectoryRow(db, directoryId) {
+  return getRow(db, `SELECT * FROM directories WHERE record_id = ?`, [directoryId]);
+}
+
+function findScopeRow(db, scopeId) {
+  return getRow(db, `SELECT * FROM scopes WHERE record_id = ?`, [scopeId]);
 }
 
 function maybeParseInt(value) {
@@ -114,6 +121,141 @@ function resolveAssigneeValue(options, currentValue = null) {
   return currentValue;
 }
 
+function resolveScopeLinkPatch(db, scopeRef, options = {}) {
+  if (options.clearScope) {
+    return {
+      scope_id: null,
+      scope_product_id: null,
+      scope_project_id: null,
+      scope_deliverable_id: null,
+    };
+  }
+  const ref = String(scopeRef || '').trim();
+  if (!ref) return {};
+  const row = findScopeRow(db, ref);
+  if (!row) throw new Error(`Scope not found: ${scopeRef}`);
+  const scope = parseRawRow(row) || row;
+  if (scope.level === 'product') {
+    return {
+      scope_id: scope.record_id,
+      scope_product_id: scope.record_id,
+      scope_project_id: null,
+      scope_deliverable_id: null,
+    };
+  }
+  if (scope.level === 'project') {
+    return {
+      scope_id: scope.record_id,
+      scope_product_id: scope.product_id ?? scope.parent_id ?? null,
+      scope_project_id: scope.record_id,
+      scope_deliverable_id: null,
+    };
+  }
+  return {
+    scope_id: scope.record_id,
+    scope_product_id: scope.product_id ?? null,
+    scope_project_id: scope.project_id ?? scope.parent_id ?? null,
+    scope_deliverable_id: scope.record_id,
+  };
+}
+
+function resolveRecordSharesAndGroups({ db, explicitGroupRef = null, inherited = null }) {
+  if (explicitGroupRef) {
+    const group = findGroupByRef(db, explicitGroupRef);
+    if (!group) throw new Error(`Group not found: ${explicitGroupRef}`);
+    return {
+      groupIds: [group.group_id],
+      shares: buildDefaultGroupShares(group, group.name || ''),
+    };
+  }
+
+  if (inherited) {
+    const inheritedGroupIds = inherited.group_ids ?? jsonField(inherited.group_ids_json);
+    const inheritedShares = inherited.shares ?? jsonField(inherited.shares_json);
+    return {
+      groupIds: inheritedGroupIds || [],
+      shares: inheritedShares || [],
+    };
+  }
+
+  const primaryGroup = requirePrimaryGroup(db);
+  return {
+    groupIds: [primaryGroup.group_id],
+    shares: buildDefaultGroupShares(primaryGroup, primaryGroup.name || ''),
+  };
+}
+
+function normalizeScopeLevel(level) {
+  const value = String(level || '').trim().toLowerCase();
+  if (!['product', 'project', 'deliverable'].includes(value)) {
+    throw new Error('Scope level must be one of: product, project, deliverable.');
+  }
+  return value;
+}
+
+function resolveScopedHierarchy(db, { level, parentId = null, productId = null, projectId = null }) {
+  const next = {
+    level: normalizeScopeLevel(level),
+    parent_id: parentId || null,
+    product_id: productId || null,
+    project_id: projectId || null,
+  };
+
+  const parentRow = next.parent_id ? findScopeRow(db, next.parent_id) : null;
+  const parent = parentRow ? (parseRawRow(parentRow) || parentRow) : null;
+  if (next.parent_id && !parent) throw new Error(`Parent scope not found: ${next.parent_id}`);
+
+  if (next.level === 'product') {
+    return {
+      level: next.level,
+      parent_id: null,
+      product_id: null,
+      project_id: null,
+    };
+  }
+
+  if (next.level === 'project') {
+    return {
+      level: next.level,
+      parent_id: parent?.record_id ?? next.parent_id,
+      product_id: next.product_id ?? (parent?.level === 'product' ? parent.record_id : parent?.product_id ?? null),
+      project_id: null,
+    };
+  }
+
+  return {
+    level: next.level,
+    parent_id: parent?.record_id ?? next.parent_id,
+    product_id: next.product_id ?? (parent?.level === 'product' ? parent.record_id : parent?.product_id ?? null),
+    project_id: next.project_id ?? (parent?.level === 'project' ? parent.record_id : parent?.project_id ?? null),
+  };
+}
+
+function normalizeNpubList(values = []) {
+  const input = Array.isArray(values) ? values : [values];
+  return [...new Set(input.map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function resolveRotatedMemberNpubs(group, options, session) {
+  const currentMembers = normalizeNpubList(group.member_npubs ?? jsonField(group.member_npubs_json));
+  const additions = normalizeNpubList(options.addMember);
+  const removals = new Set(normalizeNpubList(options.removeMember));
+  const nextMembers = new Set([...currentMembers, ...additions]);
+
+  for (const memberNpub of removals) {
+    nextMembers.delete(memberNpub);
+  }
+
+  if (group.owner_npub) nextMembers.add(group.owner_npub);
+  if (session.npub) nextMembers.add(session.npub);
+
+  const resolved = [...nextMembers];
+  if (resolved.length === 0) {
+    throw new Error('Group rotation requires at least one member.');
+  }
+  return resolved;
+}
+
 async function createAudioAttachmentBatch({
   db,
   config,
@@ -129,7 +271,7 @@ async function createAudioAttachmentBatch({
 }) {
   const uploaded = await uploadEncryptedAudioToStorage(client, filePath, {
     ownerNpub: config.workspaceOwnerNpub,
-    accessGroupNpubs: resolveStorageAccessGroupNpubs(db, targetGroupIds),
+    accessGroupIds: resolveStorageAccessGroupIds(db, targetGroupIds),
     contentType: detectMimeType(filePath, 'audio/webm'),
     fileName: defaultFileName(filePath, 'voice-note'),
   });
@@ -389,6 +531,31 @@ async function runSyncCommand() {
 program.command('sync').action(runSyncCommand);
 program.command('getLatest').action(runSyncCommand);
 
+const groups = program.command('groups');
+groups.command('rotate')
+  .argument('<groupRef>')
+  .option('--add-member <npub...>', 'include additional members in the rotated epoch')
+  .option('--remove-member <npub...>', 'exclude members from the rotated epoch')
+  .option('--name <name>', 'optionally rename the group while rotating')
+  .action(async (groupRef, options) => {
+    const { client, db, config, session } = await refreshClientAndState();
+    const row = findGroupByRef(db, groupRef);
+    if (!row) throw new Error(`Group not found: ${groupRef}`);
+    const group = parseRawRow(row) || row;
+    const memberNpubs = resolveRotatedMemberNpubs(group, options, session);
+    const groupIdentity = createGroupIdentity();
+    const response = await client.rotateGroup(group.group_id, {
+      group_npub: groupIdentity.npub,
+      member_keys: buildWrappedMemberKeys(groupIdentity, memberNpubs, session.npub, session.secret),
+      ...(options.name !== undefined ? { name: options.name } : {}),
+    });
+    await syncWorkspace({ client, config, session, quiet: true });
+    printResult({
+      ...response,
+      member_npubs: memberNpubs,
+    });
+  });
+
 const tasks = program.command('tasks');
 tasks.command('create')
   .requiredOption('--title <title>')
@@ -400,6 +567,7 @@ tasks.command('create')
   .option('--scheduled-for <date>')
   .option('--parent <taskId>')
   .option('--group <groupRef>')
+  .option('--scope <scopeId>')
   .action(async (options) => {
     const { client, db, config, session, groupKeys } = await refreshClientAndState();
     const primaryGroup = options.group
@@ -409,6 +577,7 @@ tasks.command('create')
     const recordId = crypto.randomUUID();
     const groupId = primaryGroup.group_id;
     const shares = buildDefaultGroupShares(primaryGroup, primaryGroup.name || '');
+    const scopePatch = resolveScopeLinkPatch(db, options.scope);
     const envelope = outboundTask(config.appNpub, session, groupKeys, {
       record_id: recordId,
       owner_npub: config.workspaceOwnerNpub,
@@ -421,6 +590,7 @@ tasks.command('create')
       board_group_id: groupId,
       scheduled_for: options.scheduledFor ?? null,
       tags: options.tags ?? '',
+      ...scopePatch,
       shares,
       group_ids: [groupId],
       version: 0,
@@ -471,6 +641,8 @@ tasks.command('update')
   .option('--clear-assignee', 'clear assigned_to_npub')
   .option('--tags <tags>')
   .option('--scheduled-for <date>')
+  .option('--scope <scopeId>')
+  .option('--clear-scope')
   .action(async (taskId, options) => {
     let { client, db, config, session, groupKeys } = getClientAndState();
     await syncWorkspace({ client, config, session, quiet: true });
@@ -486,6 +658,7 @@ tasks.command('update')
       assigned_to_npub: resolveAssigneeValue(options, task.assigned_to_npub ?? null),
       tags: options.tags ?? task.tags,
       scheduled_for: options.scheduledFor ?? task.scheduled_for,
+      ...resolveScopeLinkPatch(db, options.scope, options),
     });
     printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
   });
@@ -572,7 +745,7 @@ tasks.command('comment-image')
     const task = parseRawRow(row);
     const uploaded = await uploadFileToStorage(client, options.file, {
       ownerNpub: config.workspaceOwnerNpub,
-      accessGroupNpubs: resolveStorageAccessGroupNpubs(db, task.group_ids || []),
+      accessGroupIds: resolveStorageAccessGroupIds(db, task.group_ids || []),
       contentType: detectMimeType(options.file, 'image/png'),
       fileName: defaultFileName(options.file, 'task-comment-image'),
     });
@@ -680,7 +853,7 @@ chat.command('image')
     const channel = parseRawRow(channelRow);
     const uploaded = await uploadFileToStorage(client, options.file, {
       ownerNpub: config.workspaceOwnerNpub,
-      accessGroupNpubs: resolveStorageAccessGroupNpubs(db, channel.group_ids || []),
+      accessGroupIds: resolveStorageAccessGroupIds(db, channel.group_ids || []),
       contentType: detectMimeType(options.file, 'image/png'),
       fileName: defaultFileName(options.file, 'chat-image'),
     });
@@ -729,6 +902,79 @@ chat.command('voice')
     printResult(await syncRecordsAndRefresh(client, config, session, [audioEnvelope, messageEnvelope]));
   });
 
+const directories = program.command('directories');
+directories.command('create')
+  .requiredOption('--title <title>')
+  .option('--parent-directory <directoryId>')
+  .option('--group <groupRef>')
+  .action(async (options) => {
+    const { client, db, config, session, groupKeys } = await refreshClientAndState();
+    const parentRow = options.parentDirectory ? findDirectoryRow(db, options.parentDirectory) : null;
+    if (options.parentDirectory && !parentRow) throw new Error(`Directory not found: ${options.parentDirectory}`);
+    const { groupIds, shares } = resolveRecordSharesAndGroups({
+      db,
+      explicitGroupRef: options.group ?? null,
+      inherited: parentRow ? (parseRawRow(parentRow) || parentRow) : null,
+    });
+    const envelope = outboundDirectory(config.appNpub, session, groupKeys, {
+      record_id: crypto.randomUUID(),
+      owner_npub: config.workspaceOwnerNpub,
+      title: options.title,
+      parent_directory_id: options.parentDirectory ?? null,
+      shares,
+      group_ids: groupIds,
+      version: 0,
+    });
+    printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
+  });
+
+directories.command('list')
+  .action(() => {
+    const db = openDb();
+    const rows = getRows(db, `SELECT * FROM directories WHERE record_state != 'deleted' ORDER BY updated_at DESC`);
+    const output = rows.map((row) => ({
+      record_id: row.record_id,
+      title: row.title,
+      parent_directory_id: row.parent_directory_id,
+      group_ids: jsonField(row.group_ids_json),
+      updated_at: row.updated_at,
+    }));
+    printResult(output);
+  });
+
+directories.command('show')
+  .argument('<directoryId>')
+  .action((directoryId) => {
+    const db = openDb();
+    const row = findDirectoryRow(db, directoryId);
+    if (!row) throw new Error(`Directory not found: ${directoryId}`);
+    printResult(parseRawRow(row) || row);
+  });
+
+directories.command('update')
+  .argument('<directoryId>')
+  .option('--title <title>')
+  .option('--parent-directory <directoryId>')
+  .option('--clear-parent')
+  .option('--group <groupRef>')
+  .action(async (directoryId, options) => {
+    const { client, db, config, session, groupKeys } = await refreshClientAndState();
+    const row = findDirectoryRow(db, directoryId);
+    if (!row) throw new Error(`Directory not found: ${directoryId}`);
+    const directory = parseRawRow(row) || row;
+    const patch = {};
+    if (options.title !== undefined) patch.title = options.title;
+    if (options.parentDirectory !== undefined) patch.parent_directory_id = options.parentDirectory;
+    if (options.clearParent) patch.parent_directory_id = null;
+    if (options.group !== undefined) {
+      const { groupIds, shares } = resolveRecordSharesAndGroups({ db, explicitGroupRef: options.group });
+      patch.group_ids = groupIds;
+      patch.shares = shares;
+    }
+    const envelope = outboundDirectory(config.appNpub, session, groupKeys, directory, patch);
+    printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
+  });
+
 const docs = program.command('docs');
 docs.command('create')
   .requiredOption('--title <title>')
@@ -736,6 +982,7 @@ docs.command('create')
   .option('--content-file <path>')
   .option('--group <groupRef>')
   .option('--parent-directory <directoryId>')
+  .option('--scope <scopeId>')
   .action(async (options) => {
     const { client, db, config, session, groupKeys } = await refreshClientAndState();
     const primaryGroup = options.group
@@ -745,12 +992,14 @@ docs.command('create')
     const groupId = primaryGroup.group_id;
     const shares = buildDefaultGroupShares(primaryGroup, primaryGroup.name || '');
     const content = options.contentFile ? readFileSync(options.contentFile, 'utf8') : options.content;
+    const scopePatch = resolveScopeLinkPatch(db, options.scope);
     const envelope = outboundDocument(config.appNpub, session, groupKeys, {
       record_id: crypto.randomUUID(),
       owner_npub: config.workspaceOwnerNpub,
       title: options.title,
       content: content ?? '',
       parent_directory_id: options.parentDirectory ?? null,
+      ...scopePatch,
       shares,
       group_ids: [groupId],
       version: 0,
@@ -792,7 +1041,7 @@ docs.command('comment')
       recordId: crypto.randomUUID(),
       body: options.body,
       parentCommentId: options.parent ?? null,
-      anchorLineNumber: Number.isFinite(options.line) ? options.line : null,
+      anchorLineNumber: Number.isFinite(options.line) ? options.line : 1,
     });
     printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
   });
@@ -828,7 +1077,7 @@ docs.command('comment-image')
     const doc = parseRawRow(row);
     const uploaded = await uploadFileToStorage(client, options.file, {
       ownerNpub: config.workspaceOwnerNpub,
-      accessGroupNpubs: resolveStorageAccessGroupNpubs(db, doc.group_ids || []),
+      accessGroupIds: resolveStorageAccessGroupIds(db, doc.group_ids || []),
       contentType: detectMimeType(options.file, 'image/png'),
       fileName: defaultFileName(options.file, 'doc-comment-image'),
     });
@@ -885,6 +1134,8 @@ docs.command('update')
   .option('--title <title>')
   .option('--content <content>')
   .option('--content-file <path>')
+  .option('--scope <scopeId>')
+  .option('--clear-scope')
   .action(async (docId, options) => {
     const { client, db, config, session, groupKeys } = await refreshClientAndState();
     const row = getRow(db, `SELECT * FROM documents WHERE record_id = ?`, [docId]);
@@ -896,6 +1147,7 @@ docs.command('update')
     const envelope = outboundDocument(config.appNpub, session, groupKeys, doc, {
       title: options.title ?? doc.title,
       content,
+      ...resolveScopeLinkPatch(db, options.scope, options),
     });
     printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
   });
@@ -1040,21 +1292,122 @@ audio.command('transcribe')
     printResult(output);
   });
 
+const scopes = program.command('scopes');
+scopes.command('create')
+  .requiredOption('--title <title>')
+  .requiredOption('--level <level>', 'product|project|deliverable')
+  .option('--description <description>')
+  .option('--parent <scopeId>')
+  .option('--product <scopeId>')
+  .option('--project <scopeId>')
+  .option('--group <groupRef>')
+  .action(async (options) => {
+    const { client, db, config, session, groupKeys } = await refreshClientAndState();
+    const { groupIds, shares } = resolveRecordSharesAndGroups({ db, explicitGroupRef: options.group ?? null });
+    const hierarchy = resolveScopedHierarchy(db, {
+      level: options.level,
+      parentId: options.parent ?? null,
+      productId: options.product ?? null,
+      projectId: options.project ?? null,
+    });
+    const envelope = outboundScope(config.appNpub, session, groupKeys, {
+      record_id: crypto.randomUUID(),
+      owner_npub: config.workspaceOwnerNpub,
+      title: options.title,
+      description: options.description ?? '',
+      ...hierarchy,
+      shares,
+      group_ids: groupIds,
+      version: 0,
+    });
+    printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
+  });
+
+scopes.command('list')
+  .action(() => {
+    const db = openDb();
+    const rows = getRows(db, `SELECT * FROM scopes WHERE record_state != 'deleted' ORDER BY updated_at DESC`);
+    const output = rows.map((row) => ({
+      record_id: row.record_id,
+      level: row.level,
+      title: row.title,
+      parent_id: row.parent_id,
+      product_id: row.product_id,
+      project_id: row.project_id,
+      group_ids: jsonField(row.group_ids_json),
+      updated_at: row.updated_at,
+    }));
+    printResult(output);
+  });
+
+scopes.command('show')
+  .argument('<scopeId>')
+  .action((scopeId) => {
+    const db = openDb();
+    const row = findScopeRow(db, scopeId);
+    if (!row) throw new Error(`Scope not found: ${scopeId}`);
+    printResult(parseRawRow(row) || row);
+  });
+
+scopes.command('update')
+  .argument('<scopeId>')
+  .option('--title <title>')
+  .option('--description <description>')
+  .option('--level <level>', 'product|project|deliverable')
+  .option('--parent <scopeId>')
+  .option('--clear-parent')
+  .option('--product <scopeId>')
+  .option('--project <scopeId>')
+  .option('--group <groupRef>')
+  .action(async (scopeId, options) => {
+    const { client, db, config, session, groupKeys } = await refreshClientAndState();
+    const row = findScopeRow(db, scopeId);
+    if (!row) throw new Error(`Scope not found: ${scopeId}`);
+    const scope = parseRawRow(row) || row;
+    const patch = {};
+    if (options.title !== undefined) patch.title = options.title;
+    if (options.description !== undefined) patch.description = options.description;
+    if (options.group !== undefined) {
+      const { groupIds, shares } = resolveRecordSharesAndGroups({ db, explicitGroupRef: options.group });
+      patch.group_ids = groupIds;
+      patch.shares = shares;
+    }
+    if (
+      options.level !== undefined
+      || options.parent !== undefined
+      || options.clearParent
+      || options.product !== undefined
+      || options.project !== undefined
+    ) {
+      Object.assign(
+        patch,
+        resolveScopedHierarchy(db, {
+          level: options.level ?? scope.level,
+          parentId: options.clearParent ? null : (options.parent ?? scope.parent_id ?? null),
+          productId: options.product ?? scope.product_id ?? null,
+          projectId: options.project ?? scope.project_id ?? null,
+        })
+      );
+    }
+    const envelope = outboundScope(config.appNpub, session, groupKeys, scope, patch);
+    printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
+  });
+
 const storage = program.command('storage');
 storage.command('upload')
   .argument('<filePath>')
-  .option('--group <groupNpub...>')
+  .option('--group <groupRef...>')
   .option('--owner <npub>')
   .option('--markdown', 'print markdown image reference if image')
   .action(async (filePath, options) => {
     const { client, db, config } = await refreshClientAndState();
     const primaryGroup = getPrimaryGroup(db);
-    const accessGroupNpubs = options.group?.length
-      ? resolveStorageAccessGroupNpubs(db, options.group)
-      : (primaryGroup?.current_group_npub ? [primaryGroup.current_group_npub] : []);
+    const accessGroupIds = options.group?.length
+      ? resolveStorageAccessGroupIds(db, options.group)
+      : (primaryGroup?.group_id ? [primaryGroup.group_id] : []);
     const uploaded = await uploadFileToStorage(client, filePath, {
       ownerNpub: options.owner || config.workspaceOwnerNpub,
-      accessGroupNpubs,
+      accessGroupIds,
       contentType: detectMimeType(filePath),
       fileName: defaultFileName(filePath, 'upload'),
     });
