@@ -16,7 +16,7 @@ import {
 } from './translators.js';
 import { decodeNsec, getSession } from './nostr.js';
 
-const FAMILY_TABLES = [
+export const FAMILY_TABLES = [
   { collection: 'channel', table: 'channels', mapper: inboundChannel },
   { collection: 'chat_message', table: 'messages', mapper: inboundChatMessage },
   { collection: 'directory', table: 'directories', mapper: inboundDirectory },
@@ -76,6 +76,11 @@ function rowForTable(table, mapped, rawRecord) {
         board_group_id: mapped.board_group_id,
         scheduled_for: mapped.scheduled_for,
         tags: mapped.tags,
+        scope_id: mapped.scope_id,
+        scope_product_id: mapped.scope_product_id,
+        scope_project_id: mapped.scope_project_id,
+        scope_deliverable_id: mapped.scope_deliverable_id,
+        references_json: json(mapped.references),
         group_ids_json: json(mapped.group_ids),
         shares_json: json(mapped.shares),
         record_state: mapped.record_state,
@@ -107,6 +112,10 @@ function rowForTable(table, mapped, rawRecord) {
         title: mapped.title,
         content: mapped.content,
         parent_directory_id: mapped.parent_directory_id,
+        scope_id: mapped.scope_id,
+        scope_product_id: mapped.scope_product_id,
+        scope_project_id: mapped.scope_project_id,
+        scope_deliverable_id: mapped.scope_deliverable_id,
         group_ids_json: json(mapped.group_ids),
         shares_json: json(mapped.shares),
         record_state: mapped.record_state,
@@ -120,6 +129,10 @@ function rowForTable(table, mapped, rawRecord) {
         owner_npub: mapped.owner_npub,
         title: mapped.title,
         parent_directory_id: mapped.parent_directory_id,
+        scope_id: mapped.scope_id,
+        scope_product_id: mapped.scope_product_id,
+        scope_project_id: mapped.scope_project_id,
+        scope_deliverable_id: mapped.scope_deliverable_id,
         group_ids_json: json(mapped.group_ids),
         shares_json: json(mapped.shares),
         record_state: mapped.record_state,
@@ -161,6 +174,8 @@ function rowForTable(table, mapped, rawRecord) {
         parent_id: mapped.parent_id,
         product_id: mapped.product_id,
         project_id: mapped.project_id,
+        group_ids_json: json(mapped.group_ids),
+        shares_json: json(mapped.shares),
         record_state: mapped.record_state,
         version: mapped.version,
         updated_at: mapped.updated_at,
@@ -225,7 +240,8 @@ export async function syncWorkspace({ client, config, session, quiet = false }) 
   const counts = { groups: groups.length, group_keys: keyRows.length };
   for (const family of FAMILY_TABLES) {
     const hash = recordFamilyHash(config.appNpub, family.collection);
-    const result = await client.fetchRecords(hash);
+    const since = getMeta(db, `sync:${family.collection}:at`);
+    const result = await client.fetchRecords(hash, since);
     const rows = [];
     for (const record of result.records ?? []) {
       try {

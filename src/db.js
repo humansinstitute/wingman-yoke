@@ -44,6 +44,10 @@ export function openDb() {
       board_group_id TEXT,
       scheduled_for TEXT,
       tags TEXT,
+      scope_id TEXT,
+      scope_product_id TEXT,
+      scope_project_id TEXT,
+      scope_deliverable_id TEXT,
       group_ids_json TEXT NOT NULL,
       shares_json TEXT NOT NULL,
       record_state TEXT,
@@ -73,6 +77,10 @@ export function openDb() {
       title TEXT,
       content TEXT,
       parent_directory_id TEXT,
+      scope_id TEXT,
+      scope_product_id TEXT,
+      scope_project_id TEXT,
+      scope_deliverable_id TEXT,
       group_ids_json TEXT NOT NULL,
       shares_json TEXT NOT NULL,
       record_state TEXT,
@@ -85,6 +93,10 @@ export function openDb() {
       owner_npub TEXT NOT NULL,
       title TEXT,
       parent_directory_id TEXT,
+      scope_id TEXT,
+      scope_product_id TEXT,
+      scope_project_id TEXT,
+      scope_deliverable_id TEXT,
       group_ids_json TEXT NOT NULL,
       shares_json TEXT NOT NULL,
       record_state TEXT,
@@ -124,6 +136,8 @@ export function openDb() {
       parent_id TEXT,
       product_id TEXT,
       project_id TEXT,
+      group_ids_json TEXT NOT NULL DEFAULT '[]',
+      shares_json TEXT NOT NULL DEFAULT '[]',
       record_state TEXT,
       version INTEGER NOT NULL,
       updated_at TEXT NOT NULL,
@@ -181,7 +195,22 @@ export function openDb() {
   ensureColumn(db, 'groups_cache', 'current_group_npub', 'TEXT');
   ensureColumn(db, 'groups_cache', 'current_epoch', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn(db, 'group_keys_cache', 'group_npub', 'TEXT');
+  ensureColumn(db, 'tasks', 'references_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn(db, 'tasks', 'assigned_to_npub', 'TEXT');
+  ensureColumn(db, 'tasks', 'scope_id', 'TEXT');
+  ensureColumn(db, 'tasks', 'scope_product_id', 'TEXT');
+  ensureColumn(db, 'tasks', 'scope_project_id', 'TEXT');
+  ensureColumn(db, 'tasks', 'scope_deliverable_id', 'TEXT');
+  ensureColumn(db, 'documents', 'scope_id', 'TEXT');
+  ensureColumn(db, 'documents', 'scope_product_id', 'TEXT');
+  ensureColumn(db, 'documents', 'scope_project_id', 'TEXT');
+  ensureColumn(db, 'documents', 'scope_deliverable_id', 'TEXT');
+  ensureColumn(db, 'directories', 'scope_id', 'TEXT');
+  ensureColumn(db, 'directories', 'scope_product_id', 'TEXT');
+  ensureColumn(db, 'directories', 'scope_project_id', 'TEXT');
+  ensureColumn(db, 'directories', 'scope_deliverable_id', 'TEXT');
+  ensureColumn(db, 'scopes', 'group_ids_json', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn(db, 'scopes', 'shares_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn(db, 'schedules', 'assigned_group_id', 'TEXT');
   ensureColumn(db, 'audio_notes', 'size_bytes', 'INTEGER');
   ensureColumn(db, 'audio_notes', 'media_encryption_json', 'TEXT');
