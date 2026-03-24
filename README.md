@@ -1,53 +1,88 @@
 # Wingman-Yoke
 
-Wingman-Yoke is the CLI that the autopilot agent uses when it needs to steer Coworker workspaces through SuperBased.
+Wingman-Yoke is the CLI that agents and operators use to interact with Coworker workspaces through SuperBased. It provides local SQLite-backed access to tasks, chat, docs, storage, and more.
+
+## Quickstart
+
+### 1. Install
+
+```bash
+# From npm
+npm install -g wingman-yoke
+
+# Or run directly
+npx wingman-yoke --help
+```
+
+For local development:
+
+```bash
+git clone https://github.com/humansinstitute/wingman-yoke.git
+cd wingman-yoke
+npm install
+```
+
+**Requires Node >= 20.**
+
+### 2. Set your identity
+
+```bash
+export WINGMAN_YOKE_NSEC=nsec1...
+```
+
+### 3. Initialize with a connection token
+
+```bash
+wingman-yoke init --token "<connection_token>"
+```
+
+You can also pass the full Agent Connect JSON package — Yoke extracts `.connection_token` automatically.
+
+### 4. Sync workspace data
+
+```bash
+wingman-yoke sync
+```
+
+This pulls workspace records into your local SQLite mirror at `~/.wingman-yoke/yoke.db`.
+
+### 5. Start working
+
+```bash
+# Check connection status
+wingman-yoke status
+
+# List and manage tasks
+wingman-yoke tasks list
+wingman-yoke tasks create --title "New task"
+wingman-yoke tasks comment <task-id> --body "Update here"
+
+# Chat
+wingman-yoke chat channels
+wingman-yoke chat send <channel-id> --body "Hello"
+
+# Docs
+wingman-yoke docs list
+wingman-yoke docs create --title "Notes" --content "hello world"
+```
+
+> **Tip:** When running from a local clone, replace `wingman-yoke` with `node src/cli.js`.
 
 ## State
 
 By default, state lives in:
 
-- `~/.wingman-yoke/yoke.db`
-- `~/.wingman-yoke/config.json`
+- `~/.wingman-yoke/yoke.db` — local SQLite mirror
+- `~/.wingman-yoke/config.json` — workspace config
 
-Compatibility fallbacks are still supported for older installs:
+Environment variables:
 
-- `WINGMAN_AP_STATE_DIR`
-- `WINGMAN_AUTOPILOT_NSEC`
-- legacy `autopilot.db` files
+- `WINGMAN_YOKE_STATE_DIR` — override state directory
+- `WINGMAN_YOKE_NSEC` — agent/operator identity
 
-Preferred environment variables:
+Legacy fallbacks (`WINGMAN_AP_STATE_DIR`, `WINGMAN_AUTOPILOT_NSEC`, `autopilot.db`) are still supported.
 
-- `WINGMAN_YOKE_STATE_DIR`
-- `WINGMAN_YOKE_NSEC`
-
-## Bootstrap
-
-From the repository root:
-
-```bash
-bun install
-export WINGMAN_YOKE_NSEC=...
-node src/cli.js init --token "<connection_token>"
-node src/cli.js sync
-```
-
-You can also pass the full Agent Connect JSON package to `init --token`; Wingman-Yoke will extract `.connection_token` automatically.
-
-## Development
-
-```bash
-bun run start -- status
-node src/cli.js sync
-```
-
-Published entrypoints:
-
-```bash
-npx wingman-yoke status
-bunx wingman-yoke status
-```
-
-## Example Commands
+## Command Reference
 
 ```bash
 node src/cli.js status
@@ -73,10 +108,19 @@ node src/cli.js docs list
 node src/cli.js docs create --title "Scratch doc" --content "hello"
 node src/cli.js docs show <doc-id>
 node src/cli.js docs update <doc-id> --content-file ./doc.md
+node src/cli.js directories create --title "Projects"
+node src/cli.js directories list
+node src/cli.js directories show <directory-id>
+node src/cli.js directories update <directory-id> --title "Renamed"
 node src/cli.js docs comment <doc-id> --body "Needs work" --line 12
 node src/cli.js docs reply <comment-id> --body "Updated"
 node src/cli.js docs comment-image <doc-id> --file ./image.png --line 12
 node src/cli.js docs voice <doc-id> --file ./voice.aiff --line 12
+
+node src/cli.js scopes create --title "Flight Deck" --level product
+node src/cli.js scopes list
+node src/cli.js scopes show <scope-id>
+node src/cli.js scopes update <scope-id> --title "Flight Deck Core"
 
 node src/cli.js storage upload ./image.png
 node src/cli.js audio list
@@ -84,8 +128,15 @@ node src/cli.js audio show <audio-note-id>
 node src/cli.js audio update-transcript <audio-note-id> --transcript "Transcript text"
 ```
 
-## Tests
+## Development
 
 ```bash
-node --test
+# Run commands locally
+node src/cli.js status
+node src/cli.js sync
+
+# Run tests
+npm test
 ```
+
+Schema compatibility is part of the Yoke test suite. It validates Yoke's supported outbound families against the published Flight Deck manifests in `../sb-publisher/schemas/flightdeck`.
