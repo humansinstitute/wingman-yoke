@@ -8,6 +8,7 @@ import {
   inboundDirectory,
   inboundDocument,
   inboundGroup,
+  inboundReport,
   inboundSchedule,
   inboundScope,
   inboundTask,
@@ -21,6 +22,7 @@ export const FAMILY_TABLES = [
   { collection: 'chat_message', table: 'messages', mapper: inboundChatMessage },
   { collection: 'directory', table: 'directories', mapper: inboundDirectory },
   { collection: 'document', table: 'documents', mapper: inboundDocument },
+  { collection: 'report', table: 'reports', mapper: inboundReport },
   { collection: 'task', table: 'tasks', mapper: inboundTask },
   { collection: 'comment', table: 'comments', mapper: inboundComment },
   { collection: 'audio_note', table: 'audio_notes', mapper: inboundAudioNote },
@@ -30,6 +32,14 @@ export const FAMILY_TABLES = [
 
 function json(value) {
   return JSON.stringify(value ?? null);
+}
+
+function newerIsoTimestamp(current, candidate) {
+  const currentTs = Date.parse(current || '');
+  const candidateTs = Date.parse(candidate || '');
+  if (!Number.isFinite(candidateTs)) return current || null;
+  if (!Number.isFinite(currentTs) || candidateTs > currentTs) return candidate;
+  return current || null;
 }
 
 function rowForTable(table, mapped, rawRecord) {
@@ -77,9 +87,11 @@ function rowForTable(table, mapped, rawRecord) {
         scheduled_for: mapped.scheduled_for,
         tags: mapped.tags,
         scope_id: mapped.scope_id,
-        scope_product_id: mapped.scope_product_id,
-        scope_project_id: mapped.scope_project_id,
-        scope_deliverable_id: mapped.scope_deliverable_id,
+        scope_l1_id: mapped.scope_l1_id,
+        scope_l2_id: mapped.scope_l2_id,
+        scope_l3_id: mapped.scope_l3_id,
+        scope_l4_id: mapped.scope_l4_id,
+        scope_l5_id: mapped.scope_l5_id,
         references_json: json(mapped.references),
         group_ids_json: json(mapped.group_ids),
         shares_json: json(mapped.shares),
@@ -113,9 +125,11 @@ function rowForTable(table, mapped, rawRecord) {
         content: mapped.content,
         parent_directory_id: mapped.parent_directory_id,
         scope_id: mapped.scope_id,
-        scope_product_id: mapped.scope_product_id,
-        scope_project_id: mapped.scope_project_id,
-        scope_deliverable_id: mapped.scope_deliverable_id,
+        scope_l1_id: mapped.scope_l1_id,
+        scope_l2_id: mapped.scope_l2_id,
+        scope_l3_id: mapped.scope_l3_id,
+        scope_l4_id: mapped.scope_l4_id,
+        scope_l5_id: mapped.scope_l5_id,
         group_ids_json: json(mapped.group_ids),
         shares_json: json(mapped.shares),
         record_state: mapped.record_state,
@@ -130,11 +144,35 @@ function rowForTable(table, mapped, rawRecord) {
         title: mapped.title,
         parent_directory_id: mapped.parent_directory_id,
         scope_id: mapped.scope_id,
-        scope_product_id: mapped.scope_product_id,
-        scope_project_id: mapped.scope_project_id,
-        scope_deliverable_id: mapped.scope_deliverable_id,
+        scope_l1_id: mapped.scope_l1_id,
+        scope_l2_id: mapped.scope_l2_id,
+        scope_l3_id: mapped.scope_l3_id,
+        scope_l4_id: mapped.scope_l4_id,
+        scope_l5_id: mapped.scope_l5_id,
         group_ids_json: json(mapped.group_ids),
         shares_json: json(mapped.shares),
+        record_state: mapped.record_state,
+        version: mapped.version,
+        updated_at: mapped.updated_at,
+        ...common,
+      };
+    case 'reports':
+      return {
+        record_id: mapped.record_id,
+        owner_npub: mapped.owner_npub,
+        title: mapped.title,
+        declaration_type: mapped.declaration_type,
+        surface: mapped.surface,
+        generated_at: mapped.generated_at,
+        payload_json: json(mapped.payload),
+        scope_id: mapped.scope_id,
+        scope_level: mapped.scope_level,
+        scope_l1_id: mapped.scope_l1_id,
+        scope_l2_id: mapped.scope_l2_id,
+        scope_l3_id: mapped.scope_l3_id,
+        scope_l4_id: mapped.scope_l4_id,
+        scope_l5_id: mapped.scope_l5_id,
+        group_ids_json: json(mapped.group_ids),
         record_state: mapped.record_state,
         version: mapped.version,
         updated_at: mapped.updated_at,
@@ -172,8 +210,11 @@ function rowForTable(table, mapped, rawRecord) {
         title: mapped.title,
         description: mapped.description,
         parent_id: mapped.parent_id,
-        product_id: mapped.product_id,
-        project_id: mapped.project_id,
+        l1_id: mapped.l1_id,
+        l2_id: mapped.l2_id,
+        l3_id: mapped.l3_id,
+        l4_id: mapped.l4_id,
+        l5_id: mapped.l5_id,
         group_ids_json: json(mapped.group_ids),
         shares_json: json(mapped.shares),
         record_state: mapped.record_state,
@@ -243,11 +284,16 @@ export async function syncWorkspace({ client, config, session, quiet = false }) 
     const since = getMeta(db, `sync:${family.collection}:at`);
     const result = await client.fetchRecords(hash, since);
     const rows = [];
+    let latestAppliedAt = since;
     for (const record of result.records ?? []) {
       try {
         const payload = decryptRecordPayload(record, session, groupKeyMap);
         const mapped = family.mapper(record, payload);
         rows.push(rowForTable(family.table, mapped, record));
+        latestAppliedAt = newerIsoTimestamp(
+          latestAppliedAt,
+          record.updated_at ?? mapped.updated_at ?? null,
+        );
       } catch (error) {
         if (!quiet) {
           console.warn(`Skipping undecryptable ${family.collection} record ${record.record_id}: ${error instanceof Error ? error.message : String(error)}`);
@@ -256,7 +302,9 @@ export async function syncWorkspace({ client, config, session, quiet = false }) 
     }
     upsertRows(db, family.table, rows);
     counts[family.collection] = rows.length;
-    putMeta(db, `sync:${family.collection}:at`, new Date().toISOString());
+    if (latestAppliedAt && latestAppliedAt !== since) {
+      putMeta(db, `sync:${family.collection}:at`, latestAppliedAt);
+    }
   }
 
   putMeta(db, 'sync:last_at', new Date().toISOString());

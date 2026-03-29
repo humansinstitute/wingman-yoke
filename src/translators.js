@@ -27,6 +27,15 @@ function normalizeKeyVersion(value) {
   return Number.isInteger(value) ? value : null;
 }
 
+function resolveAccessibleGroupEntry(groupKeys, groupRef, options = {}) {
+  const ref = normalizeGroupRef(groupRef);
+  if (!ref) return null;
+  const keyVersion = normalizeKeyVersion(options.keyVersion);
+  const entry = groupKeys.get(ref, keyVersion != null ? { keyVersion } : {});
+  if (!entry?.groupNpub) return null;
+  return entry;
+}
+
 function latestKeyEntry(keyring) {
   let latest = null;
   for (const entry of keyring.values()) {
@@ -168,6 +177,155 @@ function normalizeRecordState(data) {
   return data.record_state ?? 'active';
 }
 
+function normalizeReportDeclarationType(value) {
+  const type = String(value || '').trim().toLowerCase();
+  if (['metric', 'timeseries', 'table', 'text'].includes(type)) return type;
+  return 'text';
+}
+
+function normalizeReportPayloadObject(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
+  return payload;
+}
+
+const LEGACY_LEVEL_MAP = { product: 'l1', project: 'l2', deliverable: 'l3' };
+
+export function normalizeScopeLevel(level) {
+  const value = String(level || '').trim().toLowerCase();
+  if (!value) return null;
+  if (LEGACY_LEVEL_MAP[value]) return LEGACY_LEVEL_MAP[value];
+  if (/^l[1-5]$/.test(value)) return value;
+  return null;
+}
+
+export function scopeDepth(level) {
+  const normalized = normalizeScopeLevel(level);
+  if (!normalized) return null;
+  return Number(normalized.charAt(1));
+}
+
+export function computeScopeLineage(selfId, level, parent) {
+  const result = {
+    level,
+    parent_id: parent?.record_id ?? null,
+    l1_id: null,
+    l2_id: null,
+    l3_id: null,
+    l4_id: null,
+    l5_id: null,
+  };
+  if (parent) {
+    for (let i = 1; i <= 5; i++) result[`l${i}_id`] = parent[`l${i}_id`] ?? null;
+  }
+  const depth = scopeDepth(level);
+  if (depth) result[`l${depth}_id`] = selfId;
+  return result;
+}
+
+export function buildScopeTags(scope) {
+  if (!scope) {
+    return { scope_id: null, scope_l1_id: null, scope_l2_id: null, scope_l3_id: null, scope_l4_id: null, scope_l5_id: null };
+  }
+  return {
+    scope_id: scope.record_id ?? null,
+    scope_l1_id: scope.l1_id ?? null,
+    scope_l2_id: scope.l2_id ?? null,
+    scope_l3_id: scope.l3_id ?? null,
+    scope_l4_id: scope.l4_id ?? null,
+    scope_l5_id: scope.l5_id ?? null,
+  };
+}
+
+function normalizeScopedRecordLineage(data) {
+  if (data.scope_l1_id !== undefined || data.scope_l2_id !== undefined) {
+    return {
+      scope_l1_id: data.scope_l1_id ?? null,
+      scope_l2_id: data.scope_l2_id ?? null,
+      scope_l3_id: data.scope_l3_id ?? null,
+      scope_l4_id: data.scope_l4_id ?? null,
+      scope_l5_id: data.scope_l5_id ?? null,
+    };
+  }
+  return {
+    scope_l1_id: data.scope_product_id ?? null,
+    scope_l2_id: data.scope_project_id ?? null,
+    scope_l3_id: data.scope_deliverable_id ?? null,
+    scope_l4_id: null,
+    scope_l5_id: null,
+  };
+}
+
+function normalizeScopeRecordLineage(data, selfId) {
+  if (data.l1_id !== undefined || data.l2_id !== undefined) {
+    return {
+      l1_id: data.l1_id ?? null,
+      l2_id: data.l2_id ?? null,
+      l3_id: data.l3_id ?? null,
+      l4_id: data.l4_id ?? null,
+      l5_id: data.l5_id ?? null,
+    };
+  }
+  const normalized = normalizeScopeLevel(data.level);
+  if (normalized === 'l1') {
+    return { l1_id: selfId, l2_id: null, l3_id: null, l4_id: null, l5_id: null };
+  }
+  if (normalized === 'l2') {
+    return { l1_id: data.product_id ?? null, l2_id: selfId, l3_id: null, l4_id: null, l5_id: null };
+  }
+  if (normalized === 'l3') {
+    return { l1_id: data.product_id ?? null, l2_id: data.project_id ?? null, l3_id: selfId, l4_id: null, l5_id: null };
+  }
+  return { l1_id: null, l2_id: null, l3_id: null, l4_id: null, l5_id: null };
+}
+
+function normalizeReportScope(scope = {}) {
+  const nextScope = scope && typeof scope === 'object' && !Array.isArray(scope) ? scope : {};
+  const level = normalizeScopeLevel(nextScope.level ?? nextScope.scope_level) ?? null;
+  if (nextScope.l1_id !== undefined || nextScope.l2_id !== undefined) {
+    return {
+      id: nextScope.id ?? nextScope.scope_id ?? null,
+      level,
+      l1_id: nextScope.l1_id ?? null,
+      l2_id: nextScope.l2_id ?? null,
+      l3_id: nextScope.l3_id ?? null,
+      l4_id: nextScope.l4_id ?? null,
+      l5_id: nextScope.l5_id ?? null,
+    };
+  }
+  return {
+    id: nextScope.id ?? nextScope.scope_id ?? null,
+    level,
+    l1_id: nextScope.product_id ?? nextScope.scope_product_id ?? null,
+    l2_id: nextScope.project_id ?? nextScope.scope_project_id ?? null,
+    l3_id: nextScope.deliverable_id ?? nextScope.scope_deliverable_id ?? null,
+    l4_id: null,
+    l5_id: null,
+  };
+}
+
+function normalizeReportMetadata(metadata = {}, recordState = 'active') {
+  const nextMetadata = metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {};
+  return {
+    title: String(nextMetadata.title || '').trim(),
+    generated_at: nextMetadata.generated_at ?? null,
+    record_state: nextMetadata.record_state ?? recordState,
+    surface: nextMetadata.surface ?? null,
+    scope: normalizeReportScope(nextMetadata.scope),
+  };
+}
+
+function reportScopeFromRecord(record = {}) {
+  return normalizeReportScope({
+    id: record.scope_id ?? null,
+    level: record.scope_level ?? null,
+    l1_id: record.scope_l1_id ?? null,
+    l2_id: record.scope_l2_id ?? null,
+    l3_id: record.scope_l3_id ?? null,
+    l4_id: record.scope_l4_id ?? null,
+    l5_id: record.scope_l5_id ?? null,
+  });
+}
+
 export function inboundGroup(group) {
   const currentGroupNpub = group.current_group_npub ?? group.group_npub ?? group.id;
   return {
@@ -192,9 +350,7 @@ export function inboundChannel(record, payload) {
     group_ids: collectGroupIds(record.group_payloads || []),
     participant_npubs: Array.isArray(data.participant_npubs) ? data.participant_npubs : [record.owner_npub],
     scope_id: data.scope_id ?? null,
-    scope_product_id: data.scope_product_id ?? null,
-    scope_project_id: data.scope_project_id ?? null,
-    scope_deliverable_id: data.scope_deliverable_id ?? null,
+    ...normalizeScopedRecordLineage(data),
     record_state: normalizeRecordState(data),
     version: record.version ?? 1,
     updated_at: record.updated_at ?? new Date().toISOString(),
@@ -232,9 +388,7 @@ export function inboundTask(record, payload) {
     scheduled_for: data.scheduled_for ?? null,
     tags: data.tags ?? '',
     scope_id: data.scope_id ?? null,
-    scope_product_id: data.scope_product_id ?? null,
-    scope_project_id: data.scope_project_id ?? null,
-    scope_deliverable_id: data.scope_deliverable_id ?? null,
+    ...normalizeScopedRecordLineage(data),
     references: Array.isArray(data.references) ? data.references : [],
     shares: normalizeShares(data.shares, record.group_payloads || []),
     group_ids: collectGroupIds(record.group_payloads || []),
@@ -271,9 +425,7 @@ export function inboundDirectory(record, payload) {
     title: data.title ?? 'Untitled directory',
     parent_directory_id: data.parent_directory_id ?? null,
     scope_id: data.scope_id ?? null,
-    scope_product_id: data.scope_product_id ?? null,
-    scope_project_id: data.scope_project_id ?? null,
-    scope_deliverable_id: data.scope_deliverable_id ?? null,
+    ...normalizeScopedRecordLineage(data),
     shares: normalizeShares(data.shares, record.group_payloads || []),
     group_ids: collectGroupIds(record.group_payloads || []),
     record_state: normalizeRecordState(data),
@@ -291,9 +443,7 @@ export function inboundDocument(record, payload) {
     content: data.content ?? '',
     parent_directory_id: data.parent_directory_id ?? null,
     scope_id: data.scope_id ?? null,
-    scope_product_id: data.scope_product_id ?? null,
-    scope_project_id: data.scope_project_id ?? null,
-    scope_deliverable_id: data.scope_deliverable_id ?? null,
+    ...normalizeScopedRecordLineage(data),
     shares: normalizeShares(data.shares, record.group_payloads || []),
     group_ids: collectGroupIds(record.group_payloads || []),
     record_state: normalizeRecordState(data),
@@ -330,15 +480,16 @@ export function inboundAudioNote(record, payload) {
 
 export function inboundScope(record, payload) {
   const data = payload.data ?? payload;
+  const level = normalizeScopeLevel(data.level) ?? data.level ?? null;
+  const lineage = normalizeScopeRecordLineage(data, record.record_id);
   return {
     record_id: record.record_id,
     owner_npub: record.owner_npub,
-    level: data.level ?? null,
+    level,
     title: data.title ?? '',
     description: data.description ?? '',
     parent_id: data.parent_id ?? null,
-    product_id: data.product_id ?? null,
-    project_id: data.project_id ?? null,
+    ...lineage,
     shares: normalizeShares(data.shares, record.group_payloads || []),
     group_ids: collectGroupIds(record.group_payloads || []),
     record_state: normalizeRecordState(data),
@@ -367,6 +518,34 @@ export function inboundSchedule(record, payload) {
     shares: normalizeShares(data.shares, record.group_payloads || []),
     group_ids: collectGroupIds(record.group_payloads || []),
     record_state: normalizeRecordState(data),
+    version: record.version ?? 1,
+    updated_at: record.updated_at ?? new Date().toISOString(),
+  };
+}
+
+export function inboundReport(record, payload) {
+  const metadata = normalizeReportMetadata(payload.metadata, 'active');
+  const declaration = payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+    ? payload.data
+    : {};
+  return {
+    record_id: record.record_id,
+    owner_npub: record.owner_npub,
+    title: metadata.title || '',
+    surface: metadata.surface ?? null,
+    generated_at: metadata.generated_at ?? record.updated_at ?? new Date().toISOString(),
+    metadata,
+    declaration_type: normalizeReportDeclarationType(declaration.declaration_type),
+    payload: normalizeReportPayloadObject(declaration.payload),
+    scope_id: metadata.scope.id ?? null,
+    scope_level: metadata.scope.level ?? null,
+    scope_l1_id: metadata.scope.l1_id ?? null,
+    scope_l2_id: metadata.scope.l2_id ?? null,
+    scope_l3_id: metadata.scope.l3_id ?? null,
+    scope_l4_id: metadata.scope.l4_id ?? null,
+    scope_l5_id: metadata.scope.l5_id ?? null,
+    group_ids: collectGroupIds(record.group_payloads || []),
+    record_state: metadata.record_state ?? 'active',
     version: record.version ?? 1,
     updated_at: record.updated_at ?? new Date().toISOString(),
   };
@@ -413,6 +592,48 @@ export function outboundSchedule(appNpub, session, groupKeys, schedule, patch = 
   };
 }
 
+export function outboundReport(appNpub, session, groupKeys, report, patch = {}) {
+  const next = { ...report, ...patch };
+  const metadata = normalizeReportMetadata({
+    title: next.title ?? report.title ?? '',
+    generated_at: next.generated_at ?? report.generated_at ?? null,
+    surface: next.surface ?? report.surface ?? null,
+    record_state: next.record_state ?? report.record_state ?? 'active',
+    scope: reportScopeFromRecord(next),
+  }, next.record_state ?? report.record_state ?? 'active');
+  const data = {
+    declaration_type: normalizeReportDeclarationType(next.declaration_type ?? report.declaration_type),
+    payload: normalizeReportPayloadObject(next.payload ?? report.payload),
+  };
+  const payload = {
+    app_namespace: appNpub,
+    collection_space: 'report',
+    schema_version: 1,
+    record_id: report.record_id,
+    metadata,
+    data,
+  };
+  const plaintext = JSON.stringify(payload);
+  const writeGroup = resolveWriteGroupMetadata(
+    groupKeys,
+    next.write_group_id
+      ?? next.write_group_npub
+      ?? resolveWriteGroup(session, groupKeys, { group_ids: next.group_ids || [] }, next.group_ids?.[0] ?? null)
+  );
+  return {
+    record_id: report.record_id,
+    owner_npub: report.owner_npub,
+    record_family_hash: recordFamilyHash(appNpub, 'report'),
+    version: (report.version ?? 0) + 1,
+    previous_version: report.version ?? 0,
+    signature_npub: session.npub,
+    write_group_id: writeGroup.groupId || undefined,
+    write_group_npub: writeGroup.groupNpub || undefined,
+    owner_payload: encryptOwnerPayload(report.owner_npub, plaintext, session),
+    group_payloads: buildGroupPayloads(next.group_ids || [], plaintext, session, groupKeys),
+  };
+}
+
 export function makeGroupWriteShare(groupRef, label = '') {
   const groupId = typeof groupRef === 'object'
     ? normalizeGroupRef(groupRef.group_id ?? groupRef.groupId ?? groupRef.id)
@@ -441,15 +662,19 @@ export function encryptOwnerPayload(ownerNpub, plaintext, session) {
 
 function buildGroupPayloads(groupIds, plaintext, session, groupKeys, canWriteMap = null) {
   const uniqueGroups = new Map();
+  const requestedRefs = [];
   for (const value of (groupIds || [])) {
     const ref = normalizeGroupRef(value);
     if (!ref) continue;
-    const keyEntry = groupKeys.get(ref);
-    if (!keyEntry?.groupNpub) {
-      throw new Error(`No group key loaded for ${ref}`);
-    }
+    requestedRefs.push(ref);
+    const keyEntry = resolveAccessibleGroupEntry(groupKeys, ref);
+    if (!keyEntry?.groupNpub) continue;
     const stableGroupId = keyEntry.groupId || ref;
     if (!uniqueGroups.has(stableGroupId)) uniqueGroups.set(stableGroupId, keyEntry);
+  }
+
+  if (uniqueGroups.size === 0 && requestedRefs.length > 0) {
+    throw new Error(`No group key loaded for ${requestedRefs[0]}`);
   }
 
   return [...uniqueGroups.entries()].map(([stableGroupId, keyEntry]) => ({
@@ -467,7 +692,7 @@ function buildGroupPayloads(groupIds, plaintext, session, groupKeys, canWriteMap
 }
 
 function resolveWriteGroup(session, groupKeys, resource, fallbackGroupId = null) {
-  const resolveGroupId = (groupRef) => groupKeys.resolveGroupId(groupRef);
+  const resolveGroupId = (groupRef) => resolveAccessibleGroupEntry(groupKeys, groupRef)?.groupId ?? null;
   const explicit = resolveGroupId(fallbackGroupId);
   if (explicit) return explicit;
   const shares = Array.isArray(resource?.shares) ? resource.shares : [];
@@ -478,6 +703,7 @@ function resolveWriteGroup(session, groupKeys, resource, fallbackGroupId = null)
       normalizeGroupRef(share?.via_group_id)
       || normalizeGroupRef(share?.via_group_npub)
     )
+    && resolveGroupId(share?.via_group_id ?? share?.via_group_npub)
   ));
   if (directPersonShare?.via_group_id || directPersonShare?.via_group_npub) {
     return resolveGroupId(directPersonShare.via_group_id ?? directPersonShare.via_group_npub);
@@ -485,11 +711,16 @@ function resolveWriteGroup(session, groupKeys, resource, fallbackGroupId = null)
   const writableGroupShare = shares.find((share) => (
     normalizeGroupRef(share?.group_id ?? share?.group_npub)
     && share?.access === 'write'
+    && resolveGroupId(share?.group_id ?? share?.group_npub)
   ));
   if (writableGroupShare?.group_id || writableGroupShare?.group_npub) {
     return resolveGroupId(writableGroupShare.group_id ?? writableGroupShare.group_npub);
   }
-  return resolveGroupId(resource?.group_ids?.find(Boolean));
+  for (const groupId of (resource?.group_ids || [])) {
+    const resolved = resolveGroupId(groupId);
+    if (resolved) return resolved;
+  }
+  return null;
 }
 
 function resolveWriteGroupMetadata(groupKeys, groupId) {
@@ -546,9 +777,11 @@ export function outboundChannel(appNpub, session, groupKeys, {
   groupIds = [],
   participantNpubs = [],
   scopeId = null,
-  scopeProductId = null,
-  scopeProjectId = null,
-  scopeDeliverableId = null,
+  scopeL1Id = null,
+  scopeL2Id = null,
+  scopeL3Id = null,
+  scopeL4Id = null,
+  scopeL5Id = null,
   version = 1,
   previousVersion = 0,
   writeGroupNpub = null,
@@ -563,9 +796,11 @@ export function outboundChannel(appNpub, session, groupKeys, {
       title,
       participant_npubs: participantNpubs,
       scope_id: scopeId,
-      scope_product_id: scopeProductId,
-      scope_project_id: scopeProjectId,
-      scope_deliverable_id: scopeDeliverableId,
+      scope_l1_id: scopeL1Id,
+      scope_l2_id: scopeL2Id,
+      scope_l3_id: scopeL3Id,
+      scope_l4_id: scopeL4Id,
+      scope_l5_id: scopeL5Id,
       record_state: recordState,
     },
   };
@@ -606,9 +841,11 @@ export function outboundTask(appNpub, session, groupKeys, task, patch = {}) {
       scheduled_for: next.scheduled_for ?? null,
       tags: next.tags ?? '',
       scope_id: next.scope_id ?? null,
-      scope_product_id: next.scope_product_id ?? null,
-      scope_project_id: next.scope_project_id ?? null,
-      scope_deliverable_id: next.scope_deliverable_id ?? null,
+      scope_l1_id: next.scope_l1_id ?? null,
+      scope_l2_id: next.scope_l2_id ?? null,
+      scope_l3_id: next.scope_l3_id ?? null,
+      scope_l4_id: next.scope_l4_id ?? null,
+      scope_l5_id: next.scope_l5_id ?? null,
       references: next.references ?? [],
       shares: next.shares ?? [],
       record_state: next.record_state ?? 'active',
@@ -694,9 +931,11 @@ export function outboundDocument(appNpub, session, groupKeys, document, patch = 
       content: next.content ?? document.content ?? '',
       parent_directory_id: next.parent_directory_id ?? document.parent_directory_id ?? null,
       scope_id: next.scope_id ?? document.scope_id ?? null,
-      scope_product_id: next.scope_product_id ?? document.scope_product_id ?? null,
-      scope_project_id: next.scope_project_id ?? document.scope_project_id ?? null,
-      scope_deliverable_id: next.scope_deliverable_id ?? document.scope_deliverable_id ?? null,
+      scope_l1_id: next.scope_l1_id ?? document.scope_l1_id ?? null,
+      scope_l2_id: next.scope_l2_id ?? document.scope_l2_id ?? null,
+      scope_l3_id: next.scope_l3_id ?? document.scope_l3_id ?? null,
+      scope_l4_id: next.scope_l4_id ?? document.scope_l4_id ?? null,
+      scope_l5_id: next.scope_l5_id ?? document.scope_l5_id ?? null,
       shares: next.shares ?? document.shares ?? [],
       record_state: next.record_state ?? document.record_state ?? 'active',
     },
@@ -791,9 +1030,11 @@ export function outboundDirectory(appNpub, session, groupKeys, directory, patch 
       title: next.title ?? directory.title ?? 'Untitled directory',
       parent_directory_id: next.parent_directory_id ?? directory.parent_directory_id ?? null,
       scope_id: next.scope_id ?? directory.scope_id ?? null,
-      scope_product_id: next.scope_product_id ?? directory.scope_product_id ?? null,
-      scope_project_id: next.scope_project_id ?? directory.scope_project_id ?? null,
-      scope_deliverable_id: next.scope_deliverable_id ?? directory.scope_deliverable_id ?? null,
+      scope_l1_id: next.scope_l1_id ?? directory.scope_l1_id ?? null,
+      scope_l2_id: next.scope_l2_id ?? directory.scope_l2_id ?? null,
+      scope_l3_id: next.scope_l3_id ?? directory.scope_l3_id ?? null,
+      scope_l4_id: next.scope_l4_id ?? directory.scope_l4_id ?? null,
+      scope_l5_id: next.scope_l5_id ?? directory.scope_l5_id ?? null,
       shares: next.shares ?? directory.shares ?? [],
       record_state: next.record_state ?? directory.record_state ?? 'active',
     },
@@ -824,10 +1065,13 @@ export function outboundScope(appNpub, session, groupKeys, scope, patch = {}) {
     data: {
       title: next.title ?? scope.title ?? '',
       description: next.description ?? scope.description ?? '',
-      level: next.level ?? scope.level ?? 'product',
+      level: next.level ?? scope.level ?? 'l1',
       parent_id: next.parent_id ?? scope.parent_id ?? null,
-      product_id: next.product_id ?? scope.product_id ?? null,
-      project_id: next.project_id ?? scope.project_id ?? null,
+      l1_id: next.l1_id ?? scope.l1_id ?? null,
+      l2_id: next.l2_id ?? scope.l2_id ?? null,
+      l3_id: next.l3_id ?? scope.l3_id ?? null,
+      l4_id: next.l4_id ?? scope.l4_id ?? null,
+      l5_id: next.l5_id ?? scope.l5_id ?? null,
       record_state: next.record_state ?? scope.record_state ?? 'active',
     },
   };

@@ -13,7 +13,7 @@ import { SuperbasedClient } from './client.js';
 import { buildWrappedMemberKeys, createGroupIdentity, decodeNsec, getSession } from './nostr.js';
 import { createStorageMarkdown, defaultFileName, detectMimeType, uploadEncryptedAudioToStorage, uploadFileToStorage } from './storage.js';
 import { syncWorkspace } from './sync.js';
-import { loadGroupKeyMap, makeGroupWriteShare, outboundAudioNote, outboundChannel, outboundChatMessage, outboundComment, outboundDirectory, outboundDocument, outboundSchedule, outboundScope, outboundTask, recordFamilyHash } from './translators.js';
+import { buildScopeTags, computeScopeLineage, loadGroupKeyMap, makeGroupWriteShare, normalizeScopeLevel, outboundAudioNote, outboundChannel, outboundChatMessage, outboundComment, outboundDirectory, outboundDocument, outboundReport, outboundSchedule, outboundScope, outboundTask, recordFamilyHash, scopeDepth } from './translators.js';
 
 function requireConfig() {
   const config = loadConfig();
@@ -106,6 +106,10 @@ function findScopeRow(db, scopeId) {
   return getRow(db, `SELECT * FROM scopes WHERE record_id = ?`, [scopeId]);
 }
 
+function findReportRow(db, reportId) {
+  return getRow(db, `SELECT * FROM reports WHERE record_id = ?`, [reportId]);
+}
+
 function maybeParseInt(value) {
   if (value == null || value === '') return null;
   const num = Number.parseInt(value, 10);
@@ -125,9 +129,11 @@ function resolveScopeLinkPatch(db, scopeRef, options = {}) {
   if (options.clearScope) {
     return {
       scope_id: null,
-      scope_product_id: null,
-      scope_project_id: null,
-      scope_deliverable_id: null,
+      scope_l1_id: null,
+      scope_l2_id: null,
+      scope_l3_id: null,
+      scope_l4_id: null,
+      scope_l5_id: null,
     };
   }
   const ref = String(scopeRef || '').trim();
@@ -135,27 +141,13 @@ function resolveScopeLinkPatch(db, scopeRef, options = {}) {
   const row = findScopeRow(db, ref);
   if (!row) throw new Error(`Scope not found: ${scopeRef}`);
   const scope = parseRawRow(row) || row;
-  if (scope.level === 'product') {
-    return {
-      scope_id: scope.record_id,
-      scope_product_id: scope.record_id,
-      scope_project_id: null,
-      scope_deliverable_id: null,
-    };
-  }
-  if (scope.level === 'project') {
-    return {
-      scope_id: scope.record_id,
-      scope_product_id: scope.product_id ?? scope.parent_id ?? null,
-      scope_project_id: scope.record_id,
-      scope_deliverable_id: null,
-    };
-  }
   return {
     scope_id: scope.record_id,
-    scope_product_id: scope.product_id ?? null,
-    scope_project_id: scope.project_id ?? scope.parent_id ?? null,
-    scope_deliverable_id: scope.record_id,
+    scope_l1_id: scope.l1_id ?? null,
+    scope_l2_id: scope.l2_id ?? null,
+    scope_l3_id: scope.l3_id ?? null,
+    scope_l4_id: scope.l4_id ?? null,
+    scope_l5_id: scope.l5_id ?? null,
   };
 }
 
@@ -185,50 +177,168 @@ function resolveRecordSharesAndGroups({ db, explicitGroupRef = null, inherited =
   };
 }
 
-function normalizeScopeLevel(level) {
-  const value = String(level || '').trim().toLowerCase();
-  if (!['product', 'project', 'deliverable'].includes(value)) {
-    throw new Error('Scope level must be one of: product, project, deliverable.');
-  }
-  return value;
+function resolveScopeHierarchy(db, scopeId, { parentId = null } = {}) {
+  const parentRow = parentId ? findScopeRow(db, parentId) : null;
+  const parent = parentRow ? (parseRawRow(parentRow) || parentRow) : null;
+  if (parentId && !parent) throw new Error(`Parent scope not found: ${parentId}`);
+
+  const parentDepth = parent ? scopeDepth(parent.level) : 0;
+  if (parentDepth >= 5) throw new Error('Cannot create scope deeper than level 5.');
+  const level = `l${parentDepth + 1}`;
+
+  return computeScopeLineage(scopeId, level, parent);
 }
 
-function resolveScopedHierarchy(db, { level, parentId = null, productId = null, projectId = null }) {
-  const next = {
-    level: normalizeScopeLevel(level),
-    parent_id: parentId || null,
-    product_id: productId || null,
-    project_id: projectId || null,
-  };
+function normalizeReportType(type, fallback = 'text') {
+  const value = String(type || '').trim().toLowerCase();
+  if (['metric', 'timeseries', 'table', 'text'].includes(value)) return value;
+  if (type == null || type === '') return fallback;
+  throw new Error('Report type must be one of: metric, timeseries, table, text.');
+}
 
-  const parentRow = next.parent_id ? findScopeRow(db, next.parent_id) : null;
-  const parent = parentRow ? (parseRawRow(parentRow) || parentRow) : null;
-  if (next.parent_id && !parent) throw new Error(`Parent scope not found: ${next.parent_id}`);
+function parseJsonText(value, label = 'JSON') {
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    throw new Error(`Invalid ${label}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
-  if (next.level === 'product') {
-    return {
-      level: next.level,
-      parent_id: null,
-      product_id: null,
-      project_id: null,
-    };
+function resolveReportPayloadInput(options, currentPayload = null) {
+  if (options.payloadFile) {
+    return parseJsonText(readFileSync(options.payloadFile, 'utf8'), `report payload file ${options.payloadFile}`);
+  }
+  if (options.payload !== undefined) {
+    return parseJsonText(options.payload, 'report payload');
+  }
+  if (currentPayload !== null) return currentPayload;
+  throw new Error('Provide --payload-file or --payload.');
+}
+
+function reportFromRow(row) {
+  const parsed = parseRawRow(row) || row;
+  if (!parsed.payload) parsed.payload = jsonField(row?.payload_json, {});
+  if (!parsed.group_ids) parsed.group_ids = jsonField(row?.group_ids_json, []);
+  return parsed;
+}
+
+function reportSummary(report) {
+  const payload = report?.payload ?? {};
+  switch (report?.declaration_type) {
+    case 'metric': {
+      const trend = payload.trend?.value != null ? ` | trend ${payload.trend.direction || 'flat'} ${payload.trend.value}` : '';
+      const unit = payload.unit ? ` ${payload.unit}` : '';
+      return `${payload.label || 'metric'}: ${payload.value ?? ''}${unit}${trend}`;
+    }
+    case 'timeseries': {
+      const series = Array.isArray(payload.series) ? payload.series : [];
+      const pointCount = series.reduce((sum, entry) => sum + (Array.isArray(entry?.points) ? entry.points.length : 0), 0);
+      return `${series.length} series, ${pointCount} points`;
+    }
+    case 'table': {
+      const columns = Array.isArray(payload.columns) ? payload.columns : [];
+      const rows = Array.isArray(payload.rows) ? payload.rows : [];
+      return `${columns.length} columns, ${rows.length} rows`;
+    }
+    case 'text':
+    default:
+      return String(payload.body || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  }
+}
+
+function padAligned(text, width, align = 'left') {
+  const value = String(text ?? '');
+  if (align === 'right') return value.padStart(width, ' ');
+  if (align === 'center') {
+    const total = Math.max(0, width - value.length);
+    const left = Math.floor(total / 2);
+    const right = total - left;
+    return `${' '.repeat(left)}${value}${' '.repeat(right)}`;
+  }
+  return value.padEnd(width, ' ');
+}
+
+function renderAsciiTable(columns = [], rows = []) {
+  const normalizedColumns = columns.map((column) => ({
+    key: column.key,
+    label: column.label,
+    align: column.align || 'left',
+  }));
+  const widths = normalizedColumns.map((column) => {
+    const cellWidth = rows.reduce((max, row) => {
+      const value = row && typeof row === 'object' ? row[column.key] : '';
+      return Math.max(max, String(value ?? '').length);
+    }, 0);
+    return Math.max(String(column.label || '').length, cellWidth);
+  });
+  const header = normalizedColumns.map((column, index) => padAligned(column.label, widths[index], 'left')).join(' | ');
+  const divider = widths.map((width) => '-'.repeat(width)).join('-+-');
+  const body = rows.map((row) => normalizedColumns.map((column, index) => (
+    padAligned(row?.[column.key] ?? '', widths[index], column.align)
+  )).join(' | '));
+  return [header, divider, ...body].join('\n');
+}
+
+function renderTimeseriesSeries(series = []) {
+  return series.flatMap((entry) => {
+    const label = String(entry?.label || entry?.key || 'series');
+    const points = Array.isArray(entry?.points) ? entry.points : [];
+    const numericValues = points.map((point) => Number(point?.y)).filter((value) => Number.isFinite(value));
+    const maxValue = numericValues.length > 0 ? Math.max(...numericValues, 0) : 0;
+    const rows = points.map((point) => {
+      const y = Number(point?.y);
+      const safeY = Number.isFinite(y) ? y : 0;
+      const barWidth = safeY > 0 && maxValue > 0 ? Math.max(1, Math.round((safeY / maxValue) * 24)) : 0;
+      const bar = '#'.repeat(barWidth);
+      return `${String(point?.x ?? '').padEnd(12)} | ${String(point?.y ?? '').padStart(6)} ${bar}`;
+    });
+    return [`${label}:`, ...rows];
+  });
+}
+
+function renderReportHuman(report) {
+  const lines = [
+    `Report: ${report.title || report.record_id}`,
+    `Type: ${report.declaration_type}`,
+    `Generated: ${report.generated_at || report.updated_at || ''}`,
+  ];
+  if (report.surface) lines.push(`Surface: ${report.surface}`);
+  if (report.scope_id) lines.push(`Scope: ${report.scope_id}${report.scope_level ? ` (${report.scope_level})` : ''}`);
+  lines.push('');
+
+  const payload = report.payload ?? {};
+  switch (report.declaration_type) {
+    case 'metric': {
+      const unit = payload.unit ? ` ${payload.unit}` : '';
+      lines.push(`${payload.label || 'Metric'}: ${payload.value ?? ''}${unit}`);
+      if (payload.trend?.value != null) {
+        lines.push(`Trend: ${payload.trend.direction || 'flat'} ${payload.trend.value}${payload.trend.label ? ` (${payload.trend.label})` : ''}`);
+      }
+      break;
+    }
+    case 'timeseries': {
+      if (payload.x_label || payload.y_label) {
+        lines.push(`Axes: ${payload.x_label || 'x'} / ${payload.y_label || 'y'}`);
+      }
+      lines.push(...renderTimeseriesSeries(payload.series));
+      break;
+    }
+    case 'table': {
+      lines.push(renderAsciiTable(
+        Array.isArray(payload.columns) ? payload.columns : [],
+        Array.isArray(payload.rows) ? payload.rows : [],
+      ));
+      break;
+    }
+    case 'text':
+    default: {
+      const tone = String(payload.tone || 'neutral').toUpperCase();
+      lines.push(`[${tone}] ${payload.body || ''}`);
+      break;
+    }
   }
 
-  if (next.level === 'project') {
-    return {
-      level: next.level,
-      parent_id: parent?.record_id ?? next.parent_id,
-      product_id: next.product_id ?? (parent?.level === 'product' ? parent.record_id : parent?.product_id ?? null),
-      project_id: null,
-    };
-  }
-
-  return {
-    level: next.level,
-    parent_id: parent?.record_id ?? next.parent_id,
-    product_id: next.product_id ?? (parent?.level === 'product' ? parent.record_id : parent?.product_id ?? null),
-    project_id: next.project_id ?? (parent?.level === 'project' ? parent.record_id : parent?.project_id ?? null),
-  };
+  return lines.join('\n').trimEnd();
 }
 
 function normalizeNpubList(values = []) {
@@ -1292,26 +1402,141 @@ audio.command('transcribe')
     printResult(output);
   });
 
+const reports = program.command('reports');
+reports.command('list')
+  .option('--type <type>', 'metric|timeseries|table|text')
+  .option('--scope <scopeId>')
+  .option('--surface <surface>')
+  .action((options) => {
+    const db = openDb();
+    const where = [`record_state != 'deleted'`];
+    const params = [];
+    if (options.type) {
+      where.push(`declaration_type = ?`);
+      params.push(normalizeReportType(options.type));
+    }
+    if (options.scope) {
+      where.push(`(scope_id = ? OR scope_l1_id = ? OR scope_l2_id = ? OR scope_l3_id = ? OR scope_l4_id = ? OR scope_l5_id = ?)`);
+      params.push(options.scope, options.scope, options.scope, options.scope, options.scope, options.scope);
+    }
+    if (options.surface) {
+      where.push(`surface = ?`);
+      params.push(options.surface);
+    }
+    const rows = getRows(
+      db,
+      `SELECT * FROM reports WHERE ${where.join(' AND ')} ORDER BY COALESCE(generated_at, updated_at) DESC`,
+      params,
+    );
+    const output = rows.map((row) => reportFromRow(row));
+    if (program.opts().json) console.log(JSON.stringify(output, null, 2));
+    else output.forEach((report) => console.log(`${report.record_id} | ${report.declaration_type} | ${report.title} | ${report.generated_at || report.updated_at || ''} | ${reportSummary(report)}`));
+  });
+
+reports.command('show')
+  .argument('<reportId>')
+  .action((reportId) => {
+    const db = openDb();
+    const row = findReportRow(db, reportId);
+    if (!row) throw new Error(`Report not found: ${reportId}`);
+    const report = reportFromRow(row);
+    if (program.opts().json) console.log(JSON.stringify(report, null, 2));
+    else console.log(renderReportHuman(report));
+  });
+
+reports.command('create')
+  .requiredOption('--title <title>')
+  .requiredOption('--type <type>', 'metric|timeseries|table|text')
+  .option('--payload-file <path>', 'JSON file containing the declaration payload')
+  .option('--payload <json>', 'inline JSON payload')
+  .option('--surface <surface>', 'render target surface', 'flightdeck')
+  .option('--group <groupRef>')
+  .option('--scope <scopeId>')
+  .option('--generated-at <iso>')
+  .action(async (options) => {
+    const { client, db, config, session, groupKeys } = await refreshClientAndState();
+    const primaryGroup = options.group
+      ? findGroupByRef(db, options.group)
+      : requirePrimaryGroup(db);
+    if (!primaryGroup) throw new Error(`Group not found: ${options.group}`);
+    const envelope = outboundReport(config.appNpub, session, groupKeys, {
+      record_id: crypto.randomUUID(),
+      owner_npub: config.workspaceOwnerNpub,
+      title: options.title,
+      declaration_type: normalizeReportType(options.type),
+      payload: resolveReportPayloadInput(options),
+      surface: options.surface ?? 'flightdeck',
+      generated_at: options.generatedAt ?? new Date().toISOString(),
+      ...resolveScopeLinkPatch(db, options.scope),
+      group_ids: [primaryGroup.group_id],
+      version: 0,
+      record_state: 'active',
+    });
+    printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
+  });
+
+reports.command('update')
+  .argument('<reportId>')
+  .option('--title <title>')
+  .option('--type <type>', 'metric|timeseries|table|text')
+  .option('--payload-file <path>', 'JSON file containing the declaration payload')
+  .option('--payload <json>', 'inline JSON payload')
+  .option('--surface <surface>')
+  .option('--group <groupRef>')
+  .option('--scope <scopeId>')
+  .option('--clear-scope')
+  .option('--generated-at <iso>')
+  .action(async (reportId, options) => {
+    const { client, db, config, session, groupKeys } = await refreshClientAndState();
+    const row = findReportRow(db, reportId);
+    if (!row) throw new Error(`Report not found: ${reportId}`);
+    const report = reportFromRow(row);
+    const patch = {};
+    if (options.title !== undefined) patch.title = options.title;
+    if (options.type !== undefined) patch.declaration_type = normalizeReportType(options.type, report.declaration_type);
+    if (options.surface !== undefined) patch.surface = options.surface;
+    if (options.generatedAt !== undefined) patch.generated_at = options.generatedAt;
+    if (options.payloadFile || options.payload !== undefined) {
+      patch.payload = resolveReportPayloadInput(options, report.payload);
+    }
+    if (options.group !== undefined) {
+      const group = findGroupByRef(db, options.group);
+      if (!group) throw new Error(`Group not found: ${options.group}`);
+      patch.group_ids = [group.group_id];
+    }
+    if (options.scope !== undefined || options.clearScope) {
+      Object.assign(patch, resolveScopeLinkPatch(db, options.scope, options));
+    }
+    const envelope = outboundReport(config.appNpub, session, groupKeys, report, patch);
+    printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
+  });
+
+reports.command('delete')
+  .argument('<reportId>')
+  .action(async (reportId) => {
+    const { client, db, config, session, groupKeys } = await refreshClientAndState();
+    const row = findReportRow(db, reportId);
+    if (!row) throw new Error(`Report not found: ${reportId}`);
+    const report = reportFromRow(row);
+    const envelope = outboundReport(config.appNpub, session, groupKeys, report, {
+      record_state: 'deleted',
+    });
+    printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
+  });
+
 const scopes = program.command('scopes');
 scopes.command('create')
   .requiredOption('--title <title>')
-  .requiredOption('--level <level>', 'product|project|deliverable')
   .option('--description <description>')
   .option('--parent <scopeId>')
-  .option('--product <scopeId>')
-  .option('--project <scopeId>')
   .option('--group <groupRef>')
   .action(async (options) => {
     const { client, db, config, session, groupKeys } = await refreshClientAndState();
     const { groupIds, shares } = resolveRecordSharesAndGroups({ db, explicitGroupRef: options.group ?? null });
-    const hierarchy = resolveScopedHierarchy(db, {
-      level: options.level,
-      parentId: options.parent ?? null,
-      productId: options.product ?? null,
-      projectId: options.project ?? null,
-    });
+    const scopeId = crypto.randomUUID();
+    const hierarchy = resolveScopeHierarchy(db, scopeId, { parentId: options.parent ?? null });
     const envelope = outboundScope(config.appNpub, session, groupKeys, {
-      record_id: crypto.randomUUID(),
+      record_id: scopeId,
       owner_npub: config.workspaceOwnerNpub,
       title: options.title,
       description: options.description ?? '',
@@ -1332,8 +1557,11 @@ scopes.command('list')
       level: row.level,
       title: row.title,
       parent_id: row.parent_id,
-      product_id: row.product_id,
-      project_id: row.project_id,
+      l1_id: row.l1_id,
+      l2_id: row.l2_id,
+      l3_id: row.l3_id,
+      l4_id: row.l4_id,
+      l5_id: row.l5_id,
       group_ids: jsonField(row.group_ids_json),
       updated_at: row.updated_at,
     }));
@@ -1353,11 +1581,8 @@ scopes.command('update')
   .argument('<scopeId>')
   .option('--title <title>')
   .option('--description <description>')
-  .option('--level <level>', 'product|project|deliverable')
   .option('--parent <scopeId>')
   .option('--clear-parent')
-  .option('--product <scopeId>')
-  .option('--project <scopeId>')
   .option('--group <groupRef>')
   .action(async (scopeId, options) => {
     const { client, db, config, session, groupKeys } = await refreshClientAndState();
@@ -1372,25 +1597,152 @@ scopes.command('update')
       patch.group_ids = groupIds;
       patch.shares = shares;
     }
-    if (
-      options.level !== undefined
-      || options.parent !== undefined
-      || options.clearParent
-      || options.product !== undefined
-      || options.project !== undefined
-    ) {
-      Object.assign(
-        patch,
-        resolveScopedHierarchy(db, {
-          level: options.level ?? scope.level,
-          parentId: options.clearParent ? null : (options.parent ?? scope.parent_id ?? null),
-          productId: options.product ?? scope.product_id ?? null,
-          projectId: options.project ?? scope.project_id ?? null,
-        })
-      );
+    if (options.parent !== undefined || options.clearParent) {
+      const parentId = options.clearParent ? null : (options.parent ?? scope.parent_id ?? null);
+      Object.assign(patch, resolveScopeHierarchy(db, scopeId, { parentId }));
     }
     const envelope = outboundScope(config.appNpub, session, groupKeys, scope, patch);
     printResult(await syncRecordsAndRefresh(client, config, session, [envelope]));
+  });
+
+const migrate = program.command('migrate');
+migrate.command('scope-lineage')
+  .description('Migrate legacy scope fields (product/project/deliverable) to generic l1-l5 lineage')
+  .option('--dry-run', 'Show what would be migrated without making changes')
+  .action(async (options) => {
+    const { client, db, config, session, groupKeys } = await refreshClientAndState();
+    const dryRun = options.dryRun === true;
+
+    // Migrate scope records (parents first, ordered by depth)
+    const scopeRows = getRows(db, `SELECT * FROM scopes WHERE record_state != 'deleted' ORDER BY level ASC, updated_at ASC`);
+    const scopeMap = new Map();
+    const migratedScopes = [];
+
+    // Build scope map for lineage lookups
+    for (const row of scopeRows) {
+      const scope = parseRawRow(row) || row;
+      scopeMap.set(scope.record_id, scope);
+    }
+
+    // Process scopes by depth (l1 first, then l2, etc.)
+    const depthOrder = ['l1', 'l2', 'l3', 'l4', 'l5'];
+    const normalizedScopes = scopeRows.map((row) => {
+      const scope = parseRawRow(row) || row;
+      const level = normalizeScopeLevel(scope.level) ?? scope.level;
+      return { ...scope, level };
+    });
+    normalizedScopes.sort((a, b) => {
+      const da = depthOrder.indexOf(a.level);
+      const db2 = depthOrder.indexOf(b.level);
+      return (da === -1 ? 99 : da) - (db2 === -1 ? 99 : db2);
+    });
+
+    for (const scope of normalizedScopes) {
+      const isLegacy = ['product', 'project', 'deliverable'].includes(String(scope.level || '').toLowerCase())
+        || (scope.l1_id === undefined && scope.l1_id === null && !scope.l1_id);
+      const alreadyCanonical = /^l[1-5]$/.test(scope.level)
+        && (scope.l1_id != null || scopeDepth(scope.level) > 1 || scope.record_id);
+
+      // Re-derive lineage from parent
+      const parent = scope.parent_id ? scopeMap.get(scope.parent_id) : null;
+      const lineage = computeScopeLineage(scope.record_id, scope.level, parent);
+
+      // Check if anything changed
+      const changed = scope.level !== lineage.level
+        || scope.l1_id !== lineage.l1_id
+        || scope.l2_id !== lineage.l2_id
+        || scope.l3_id !== lineage.l3_id
+        || scope.l4_id !== lineage.l4_id
+        || scope.l5_id !== lineage.l5_id;
+
+      if (!changed) {
+        // Update the map so children can use canonical lineage
+        scopeMap.set(scope.record_id, { ...scope, ...lineage });
+        continue;
+      }
+
+      const updated = { ...scope, ...lineage };
+      scopeMap.set(scope.record_id, updated);
+      migratedScopes.push(updated);
+    }
+
+    if (!dryRun && migratedScopes.length > 0) {
+      const envelopes = migratedScopes.map((scope) =>
+        outboundScope(config.appNpub, session, groupKeys, scope)
+      );
+      for (let i = 0; i < envelopes.length; i += 20) {
+        const batch = envelopes.slice(i, i + 20);
+        await syncRecordsAndRefresh(client, config, session, batch);
+      }
+    }
+
+    // Migrate scoped records (tasks, documents, directories, reports)
+    const scopedTables = [
+      { table: 'tasks', outbound: outboundTask },
+      { table: 'documents', outbound: outboundDocument },
+      { table: 'directories', outbound: outboundDirectory },
+    ];
+    const migratedRecords = { scopes: migratedScopes.length };
+
+    for (const { table, outbound } of scopedTables) {
+      const rows = getRows(db, `SELECT * FROM ${table} WHERE record_state != 'deleted' AND scope_id IS NOT NULL`);
+      const toMigrate = [];
+
+      for (const row of rows) {
+        const record = parseRawRow(row) || row;
+        const scope = scopeMap.get(record.scope_id);
+        if (!scope) continue;
+
+        const tags = buildScopeTags(scope);
+        const changed = record.scope_l1_id !== tags.scope_l1_id
+          || record.scope_l2_id !== tags.scope_l2_id
+          || record.scope_l3_id !== tags.scope_l3_id
+          || record.scope_l4_id !== tags.scope_l4_id
+          || record.scope_l5_id !== tags.scope_l5_id;
+
+        if (changed) {
+          toMigrate.push({ ...record, ...tags });
+        }
+      }
+
+      if (!dryRun && toMigrate.length > 0) {
+        const envelopes = toMigrate.map((record) => outbound(config.appNpub, session, groupKeys, record));
+        for (let i = 0; i < envelopes.length; i += 20) {
+          const batch = envelopes.slice(i, i + 20);
+          await syncRecordsAndRefresh(client, config, session, batch);
+        }
+      }
+
+      migratedRecords[table] = toMigrate.length;
+    }
+
+    // Reports have a different outbound signature
+    const reportRows = getRows(db, `SELECT * FROM reports WHERE record_state != 'deleted' AND scope_id IS NOT NULL`);
+    const reportsToMigrate = [];
+    for (const row of reportRows) {
+      const record = parseRawRow(row) || row;
+      const scope = scopeMap.get(record.scope_id);
+      if (!scope) continue;
+      const tags = buildScopeTags(scope);
+      const changed = record.scope_l1_id !== tags.scope_l1_id
+        || record.scope_l2_id !== tags.scope_l2_id
+        || record.scope_l3_id !== tags.scope_l3_id
+        || record.scope_l4_id !== tags.scope_l4_id
+        || record.scope_l5_id !== tags.scope_l5_id;
+      if (changed) {
+        reportsToMigrate.push({ ...record, ...tags, scope_level: scope.level });
+      }
+    }
+    if (!dryRun && reportsToMigrate.length > 0) {
+      const envelopes = reportsToMigrate.map((record) => outboundReport(config.appNpub, session, groupKeys, record));
+      for (let i = 0; i < envelopes.length; i += 20) {
+        const batch = envelopes.slice(i, i + 20);
+        await syncRecordsAndRefresh(client, config, session, batch);
+      }
+    }
+    migratedRecords.reports = reportsToMigrate.length;
+
+    printResult({ dryRun, migrated: migratedRecords });
   });
 
 const storage = program.command('storage');

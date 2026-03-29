@@ -104,6 +104,25 @@ export function openDb() {
       updated_at TEXT NOT NULL,
       raw_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS reports (
+      record_id TEXT PRIMARY KEY,
+      owner_npub TEXT NOT NULL,
+      title TEXT,
+      declaration_type TEXT,
+      surface TEXT,
+      generated_at TEXT,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      scope_id TEXT,
+      scope_level TEXT,
+      scope_product_id TEXT,
+      scope_project_id TEXT,
+      scope_deliverable_id TEXT,
+      group_ids_json TEXT NOT NULL DEFAULT '[]',
+      record_state TEXT,
+      version INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      raw_json TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS audio_notes (
       record_id TEXT PRIMARY KEY,
       owner_npub TEXT NOT NULL,
@@ -136,6 +155,11 @@ export function openDb() {
       parent_id TEXT,
       product_id TEXT,
       project_id TEXT,
+      l1_id TEXT,
+      l2_id TEXT,
+      l3_id TEXT,
+      l4_id TEXT,
+      l5_id TEXT,
       group_ids_json TEXT NOT NULL DEFAULT '[]',
       shares_json TEXT NOT NULL DEFAULT '[]',
       record_state TEXT,
@@ -209,6 +233,17 @@ export function openDb() {
   ensureColumn(db, 'directories', 'scope_product_id', 'TEXT');
   ensureColumn(db, 'directories', 'scope_project_id', 'TEXT');
   ensureColumn(db, 'directories', 'scope_deliverable_id', 'TEXT');
+  ensureColumn(db, 'reports', 'title', 'TEXT');
+  ensureColumn(db, 'reports', 'declaration_type', 'TEXT');
+  ensureColumn(db, 'reports', 'surface', 'TEXT');
+  ensureColumn(db, 'reports', 'generated_at', 'TEXT');
+  ensureColumn(db, 'reports', 'payload_json', "TEXT NOT NULL DEFAULT '{}'");
+  ensureColumn(db, 'reports', 'scope_id', 'TEXT');
+  ensureColumn(db, 'reports', 'scope_level', 'TEXT');
+  ensureColumn(db, 'reports', 'scope_product_id', 'TEXT');
+  ensureColumn(db, 'reports', 'scope_project_id', 'TEXT');
+  ensureColumn(db, 'reports', 'scope_deliverable_id', 'TEXT');
+  ensureColumn(db, 'reports', 'group_ids_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn(db, 'scopes', 'group_ids_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn(db, 'scopes', 'shares_json', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn(db, 'schedules', 'assigned_group_id', 'TEXT');
@@ -216,6 +251,17 @@ export function openDb() {
   ensureColumn(db, 'audio_notes', 'media_encryption_json', 'TEXT');
   ensureColumn(db, 'audio_notes', 'waveform_preview_json', 'TEXT');
   ensureColumn(db, 'audio_notes', 'sender_npub', 'TEXT');
+  // Scope hierarchy l1-l5 columns (leave old product_id/project_id/scope_*_id inert)
+  ensureColumn(db, 'scopes', 'l1_id', 'TEXT');
+  ensureColumn(db, 'scopes', 'l2_id', 'TEXT');
+  ensureColumn(db, 'scopes', 'l3_id', 'TEXT');
+  ensureColumn(db, 'scopes', 'l4_id', 'TEXT');
+  ensureColumn(db, 'scopes', 'l5_id', 'TEXT');
+  for (const table of ['tasks', 'documents', 'directories', 'reports']) {
+    for (let i = 1; i <= 5; i++) {
+      ensureColumn(db, table, `scope_l${i}_id`, 'TEXT');
+    }
+  }
   return db;
 }
 

@@ -4,10 +4,12 @@ import { generateSecretKey, getPublicKey, nip19 } from 'nostr-tools';
 import { decodeNsec, encryptForNpub } from '../src/nostr.js';
 import {
   decryptRecordPayload,
+  inboundReport,
   inboundSchedule,
   inboundTask,
   loadGroupKeyMap,
   outboundDocument,
+  outboundReport,
   outboundSchedule,
   outboundTask,
 } from '../src/translators.js';
@@ -179,6 +181,43 @@ test('outboundTask preserves existing assignee when patch does not override it',
   assert.equal(decrypted.data.assigned_to_npub, assigneeNpub);
 });
 
+test('outboundTask falls back to an accessible shared group when the board group key is missing', () => {
+  const session = makeSession();
+  const ownerNpub = makeNpub();
+  const privateGroupId = 'group-private-missing';
+  const sharedGroupId = 'group-shared-accessible';
+  const sharedKeyRow = makeWrappedKeyRow(session, { groupId: sharedGroupId, keyVersion: 4 });
+  const groupKeys = loadGroupKeyMap(session, [sharedKeyRow], decodeNsec);
+  const task = {
+    record_id: 'task-fallback-group',
+    owner_npub: ownerNpub,
+    title: 'Task',
+    description: '',
+    shares: [
+      { type: 'group', group_id: privateGroupId, access: 'write' },
+      { type: 'group', group_id: sharedGroupId, access: 'write', group_npub: sharedKeyRow.group_npub },
+    ],
+    group_ids: [privateGroupId, sharedGroupId],
+    board_group_id: privateGroupId,
+    version: 2,
+  };
+
+  const envelope = outboundTask('npub1app', session, groupKeys, task, {
+    description: 'Updated',
+  });
+  const decrypted = decryptRecordPayload({
+    record_id: task.record_id,
+    owner_npub: ownerNpub,
+    signature_npub: session.npub,
+    group_payloads: envelope.group_payloads,
+  }, session, groupKeys);
+
+  assert.equal(envelope.write_group_id, sharedGroupId);
+  assert.equal(envelope.write_group_npub, sharedKeyRow.group_npub);
+  assert.deepEqual(envelope.group_payloads.map((payload) => payload.group_id), [sharedGroupId]);
+  assert.equal(decrypted.data.description, 'Updated');
+});
+
 test('decryptRecordPayload can still read epoch 1 records after later epochs are cached', () => {
   const session = makeSession();
   const ownerNpub = makeNpub();
@@ -287,4 +326,98 @@ test('outboundSchedule emits a valid schedule record envelope', () => {
   assert.equal(decrypted.data.assigned_group_id, groupId);
   assert.equal(decrypted.data.title, 'Morning briefing');
   assert.deepEqual(decrypted.data.days, ['mon', 'wed']);
+});
+
+test('inboundReport materializes declarative report metadata and payload', () => {
+  const report = inboundReport({
+    record_id: 'report-1',
+    owner_npub: makeNpub(),
+    version: 2,
+    updated_at: '2026-03-25T01:00:00Z',
+    group_payloads: [{
+      group_id: 'group-report',
+      group_npub: makeNpub(),
+    }],
+  }, {
+    metadata: {
+      title: 'Daily Users',
+      generated_at: '2026-03-25T00:55:00Z',
+      record_state: 'active',
+      surface: 'flightdeck',
+      scope: {
+        id: 'scope-project',
+        level: 'project',
+        product_id: 'scope-product',
+        project_id: 'scope-project',
+        deliverable_id: null,
+      },
+    },
+    data: {
+      declaration_type: 'metric',
+      payload: {
+        label: 'Daily Users',
+        value: 50,
+      },
+    },
+  });
+
+  assert.equal(report.title, 'Daily Users');
+  assert.equal(report.declaration_type, 'metric');
+  assert.equal(report.surface, 'flightdeck');
+  assert.equal(report.scope_id, 'scope-project');
+  assert.equal(report.scope_level, 'l2');
+  assert.deepEqual(report.group_ids, ['group-report']);
+  assert.equal(report.payload.value, 50);
+});
+
+test('outboundReport encrypts a report envelope compatible with Flight Deck schema', () => {
+  const session = makeSession();
+  const ownerNpub = makeNpub();
+  const groupId = 'group-report';
+  const keyRow = makeWrappedKeyRow(session, { groupId, keyVersion: 2 });
+  const groupKeys = loadGroupKeyMap(session, [keyRow], decodeNsec);
+
+  const envelope = outboundReport('npub1app', session, groupKeys, {
+    record_id: 'report-1',
+    owner_npub: ownerNpub,
+    title: 'Done Per Day',
+    declaration_type: 'timeseries',
+    payload: {
+      x_label: 'Date',
+      y_label: 'Done tasks',
+      series: [{
+        key: 'done',
+        label: 'Done',
+        points: [
+          { x: '2026-03-20', y: 1 },
+          { x: '2026-03-21', y: 2 },
+        ],
+      }],
+    },
+    surface: 'flightdeck',
+    generated_at: '2026-03-25T00:55:00Z',
+    scope_id: 'scope-project',
+    scope_level: 'l2',
+    scope_l1_id: 'scope-product',
+    scope_l2_id: 'scope-project',
+    scope_l3_id: null,
+    scope_l4_id: null,
+    scope_l5_id: null,
+    group_ids: [groupId],
+    version: 0,
+  });
+  const decrypted = decryptRecordPayload({
+    record_id: envelope.record_id,
+    owner_npub: ownerNpub,
+    signature_npub: session.npub,
+    group_payloads: envelope.group_payloads,
+  }, session, groupKeys);
+
+  assert.equal(envelope.record_family_hash, 'npub1app:report');
+  assert.equal(envelope.write_group_id, groupId);
+  assert.equal(envelope.write_group_npub, keyRow.group_npub);
+  assert.equal(decrypted.metadata.title, 'Done Per Day');
+  assert.equal(decrypted.metadata.surface, 'flightdeck');
+  assert.equal(decrypted.data.declaration_type, 'timeseries');
+  assert.equal(decrypted.data.payload.series[0].points[1].y, 2);
 });
