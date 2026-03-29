@@ -1638,11 +1638,6 @@ migrate.command('scope-lineage')
     });
 
     for (const scope of normalizedScopes) {
-      const isLegacy = ['product', 'project', 'deliverable'].includes(String(scope.level || '').toLowerCase())
-        || (scope.l1_id === undefined && scope.l1_id === null && !scope.l1_id);
-      const alreadyCanonical = /^l[1-5]$/.test(scope.level)
-        && (scope.l1_id != null || scopeDepth(scope.level) > 1 || scope.record_id);
-
       // Re-derive lineage from parent
       const parent = scope.parent_id ? scopeMap.get(scope.parent_id) : null;
       const lineage = computeScopeLineage(scope.record_id, scope.level, parent);
@@ -1716,7 +1711,48 @@ migrate.command('scope-lineage')
       migratedRecords[table] = toMigrate.length;
     }
 
-    // Reports have a different outbound signature
+    // Channels use a destructured outbound signature
+    const channelRows = getRows(db, `SELECT * FROM channels WHERE record_state != 'deleted'`);
+    const channelsToMigrate = [];
+    for (const row of channelRows) {
+      const record = parseRawRow(row) || row;
+      if (!record.scope_id) continue;
+      const scope = scopeMap.get(record.scope_id);
+      if (!scope) continue;
+      const tags = buildScopeTags(scope);
+      const changed = record.scope_l1_id !== tags.scope_l1_id
+        || record.scope_l2_id !== tags.scope_l2_id
+        || record.scope_l3_id !== tags.scope_l3_id
+        || record.scope_l4_id !== tags.scope_l4_id
+        || record.scope_l5_id !== tags.scope_l5_id;
+      if (changed) {
+        channelsToMigrate.push({ ...record, ...tags });
+      }
+    }
+    if (!dryRun && channelsToMigrate.length > 0) {
+      const envelopes = channelsToMigrate.map((record) => outboundChannel(config.appNpub, session, groupKeys, {
+        recordId: record.record_id,
+        ownerNpub: record.owner_npub,
+        title: record.title,
+        groupIds: record.group_ids || [],
+        participantNpubs: record.participant_npubs || [],
+        scopeId: record.scope_id,
+        scopeL1Id: record.scope_l1_id,
+        scopeL2Id: record.scope_l2_id,
+        scopeL3Id: record.scope_l3_id,
+        scopeL4Id: record.scope_l4_id,
+        scopeL5Id: record.scope_l5_id,
+        version: record.version ?? 1,
+        previousVersion: (record.version ?? 1) - 1,
+      }));
+      for (let i = 0; i < envelopes.length; i += 20) {
+        const batch = envelopes.slice(i, i + 20);
+        await syncRecordsAndRefresh(client, config, session, batch);
+      }
+    }
+    migratedRecords.channels = channelsToMigrate.length;
+
+    // Reports use a different outbound signature
     const reportRows = getRows(db, `SELECT * FROM reports WHERE record_state != 'deleted' AND scope_id IS NOT NULL`);
     const reportsToMigrate = [];
     for (const row of reportRows) {
