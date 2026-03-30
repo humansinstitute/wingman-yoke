@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { finalizeEvent, getPublicKey, nip19, nip44 } from 'nostr-tools';
+import { finalizeEvent, generateSecretKey, getPublicKey, nip19, nip44 } from 'nostr-tools';
 
 function loadNsecFromBitwarden() {
   const sessionPath = join(homedir(), '.bw_session');
@@ -36,6 +36,25 @@ export function decodeNpub(npub) {
 
 export function encodeNsec(secret) {
   return nip19.nsecEncode(secret);
+}
+
+export function createGroupIdentity(secret = generateSecretKey()) {
+  const pubkey = getPublicKey(secret);
+  return {
+    secret,
+    pubkey,
+    npub: nip19.npubEncode(pubkey),
+    nsec: encodeNsec(secret),
+  };
+}
+
+export function buildWrappedMemberKeys(groupIdentity, memberNpubs, wrappedByNpub, wrappedBySecret) {
+  const uniqueMembers = [...new Set((memberNpubs || []).map((value) => String(value || '').trim()).filter(Boolean))];
+  return uniqueMembers.map((member_npub) => ({
+    member_npub,
+    wrapped_group_nsec: encryptForNpub(wrappedBySecret, member_npub, groupIdentity.nsec),
+    wrapped_by_npub: wrappedByNpub,
+  }));
 }
 
 export function getSession(secret = decodeNsec(getConfiguredNsec())) {

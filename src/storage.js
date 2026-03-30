@@ -66,20 +66,24 @@ export function createStorageMarkdown(objectId, fileName = 'image') {
 
 export async function uploadFileToStorage(client, filePath, {
   ownerNpub,
-  accessGroupNpubs = [],
+  accessGroupIds = [],
+  ownerGroupId = null,
   contentType = null,
   fileName = null,
 } = {}) {
   const bytes = readFileBytes(filePath);
   const nextFileName = fileName || defaultFileName(filePath, 'upload');
   const nextContentType = contentType || detectMimeType(filePath);
-  const prepared = await client.prepareStorageObject({
+  const body = {
     owner_npub: ownerNpub,
     content_type: nextContentType,
     size_bytes: bytes.byteLength,
     file_name: nextFileName,
-    access_group_npubs: accessGroupNpubs,
-  });
+    access_group_ids: accessGroupIds,
+  };
+  const resolvedOwnerGroupId = ownerGroupId || accessGroupIds[0] || null;
+  if (resolvedOwnerGroupId) body.owner_group_id = resolvedOwnerGroupId;
+  const prepared = await client.prepareStorageObject(body);
   await client.uploadPreparedStorageObject(prepared, bytes, nextContentType);
   await client.completeStorageObject(prepared.object_id, {
     size_bytes: bytes.byteLength,
@@ -112,7 +116,8 @@ export async function encryptAudioBytes(bytes) {
 
 export async function uploadEncryptedAudioToStorage(client, filePath, {
   ownerNpub,
-  accessGroupNpubs = [],
+  accessGroupIds = [],
+  ownerGroupId = null,
   contentType = null,
   fileName = null,
 } = {}) {
@@ -122,13 +127,16 @@ export async function uploadEncryptedAudioToStorage(client, filePath, {
     const encrypted = await encryptAudioBytes(plainBytes);
     const nextFileName = fileName || normalized.fileName || defaultFileName(normalized.filePath, 'voice-note');
     const nextContentType = normalized.contentType || detectMimeType(normalized.filePath, 'audio/webm');
-    const prepared = await client.prepareStorageObject({
+    const body = {
       owner_npub: ownerNpub,
       content_type: nextContentType,
       size_bytes: encrypted.encryptedBytes.byteLength,
       file_name: nextFileName,
-      access_group_npubs: accessGroupNpubs,
-    });
+      access_group_ids: accessGroupIds,
+    };
+    const resolvedOwnerGroupId = ownerGroupId || accessGroupIds[0] || null;
+    if (resolvedOwnerGroupId) body.owner_group_id = resolvedOwnerGroupId;
+    const prepared = await client.prepareStorageObject(body);
     await client.uploadPreparedStorageObject(prepared, encrypted.encryptedBytes, nextContentType);
     await client.completeStorageObject(prepared.object_id, {
       size_bytes: encrypted.encryptedBytes.byteLength,

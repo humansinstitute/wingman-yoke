@@ -35,30 +35,72 @@ export class SuperbasedClient {
   }
 
   getGroups() {
-    return this.request(`/api/v4/groups?owner_npub=${encodeURIComponent(this.session.npub)}`);
+    return this.request(`/api/v4/groups?npub=${encodeURIComponent(this.session.npub)}`);
   }
 
   getGroupKeys() {
     return this.request(`/api/v4/groups/keys?member_npub=${encodeURIComponent(this.session.npub)}`);
   }
 
-  fetchRecords(recordFamilyHash, since = null) {
+  rotateGroup(groupId, body) {
+    return this.request(`/api/v4/groups/${encodeURIComponent(groupId)}/rotate`, {
+      method: 'POST',
+      body,
+    });
+  }
+
+  async fetchRecords(recordFamilyHash, since = null) {
+    const PAGE_SIZE = 200;
+    let offset = 0;
+    let allRecords = [];
+
+    while (true) {
+      const params = new URLSearchParams({
+        owner_npub: this.config.workspaceOwnerNpub,
+        viewer_npub: this.session.npub,
+        record_family_hash: recordFamilyHash,
+        limit: String(PAGE_SIZE),
+        offset: String(offset),
+      });
+      if (since) params.set('since', since);
+      const page = await this.request(`/api/v4/records?${params.toString()}`);
+      const records = page.records ?? [];
+      allRecords = allRecords.concat(records);
+      if (!page.has_more || records.length === 0) break;
+      offset += records.length;
+    }
+
+    return { records: allRecords };
+  }
+
+  getRecordHistory(recordId) {
     const params = new URLSearchParams({
       owner_npub: this.config.workspaceOwnerNpub,
       viewer_npub: this.session.npub,
-      record_family_hash: recordFamilyHash,
     });
-    if (since) params.set('since', since);
-    return this.request(`/api/v4/records?${params.toString()}`);
+    return this.request(`/api/v4/records/${encodeURIComponent(recordId)}/history?${params.toString()}`);
   }
 
   async syncRecords(records) {
+    const normalizedRecords = (records || []).map((record) => {
+      const normalized = { ...record };
+      const writeGroupNpub = String(record?.write_group_npub || '').trim();
+      if (writeGroupNpub) {
+        normalized.write_group_npub = writeGroupNpub;
+        delete normalized.write_group_id;
+        return normalized;
+      }
+
+      const writeGroupId = String(record?.write_group_id || '').trim();
+      if (writeGroupId) normalized.write_group_id = writeGroupId;
+      return normalized;
+    });
     const proofBody = {
       owner_npub: this.config.workspaceOwnerNpub,
-      records,
+      records: normalizedRecords,
     };
     const groupWriteTokens = {};
-    for (const record of records) {
+    for (const record of normalizedRecords) {
       const groupRef = String(record.write_group_id || record.write_group_npub || '').trim();
       if (!groupRef || groupWriteTokens[groupRef]) continue;
       const keyEntry = this.groupKeys.getCurrent

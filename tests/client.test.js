@@ -11,7 +11,7 @@ function makeNpub(secret = makeSecret()) {
   return nip19.npubEncode(getPublicKey(secret));
 }
 
-test('syncRecords signs group proof with keyEntry.secret', async () => {
+test('syncRecords prefers write_group_npub and signs group proof with keyEntry.secret', async () => {
   const sessionSecret = makeSecret();
   const groupSecret = makeSecret();
   const groupId = 'group-123';
@@ -52,7 +52,80 @@ test('syncRecords signs group proof with keyEntry.secret', async () => {
     assert.equal(result.synced, 1);
     assert.equal(calls.length, 1);
     const body = JSON.parse(calls[0][1].body);
-    assert.ok(body.group_write_tokens[groupId]);
+    assert.equal(body.records[0].write_group_id, undefined);
+    assert.equal(body.records[0].write_group_npub, groupNpub);
+    assert.ok(body.group_write_tokens[groupNpub]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('getGroups queries by member npub', async () => {
+  const secret = makeSecret();
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push([url, options]);
+    return new Response(JSON.stringify({ groups: [] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  try {
+    const sessionNpub = makeNpub(secret);
+    const client = new SuperbasedClient({
+      config: {
+        directHttpsUrl: 'https://sb4.otherstuff.studio',
+        workspaceOwnerNpub: makeNpub(),
+      },
+      session: {
+        secret,
+        npub: sessionNpub,
+      },
+      groupKeys: new Map(),
+    });
+    await client.getGroups();
+    assert.match(calls[0][0], new RegExp(`/api/v4/groups\\?npub=${encodeURIComponent(sessionNpub)}$`));
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('rotateGroup posts a new epoch payload to the rotate endpoint', async () => {
+  const secret = makeSecret();
+  const groupId = 'group-rotate-1';
+  const payload = {
+    group_npub: makeNpub(),
+    member_keys: [
+      { member_npub: makeNpub(), wrapped_group_nsec: 'wrapped-1', wrapped_by_npub: makeNpub() },
+    ],
+  };
+  const calls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push([url, options]);
+    return new Response(JSON.stringify({ group_id: groupId, current_epoch: 2 }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  try {
+    const client = new SuperbasedClient({
+      config: {
+        directHttpsUrl: 'https://sb4.otherstuff.studio',
+        workspaceOwnerNpub: makeNpub(),
+      },
+      session: {
+        secret,
+        npub: makeNpub(secret),
+      },
+      groupKeys: new Map(),
+    });
+    const result = await client.rotateGroup(groupId, payload);
+    assert.equal(result.current_epoch, 2);
+    assert.match(calls[0][0], new RegExp(`/api/v4/groups/${encodeURIComponent(groupId)}/rotate$`));
+    assert.equal(calls[0][1].method, 'POST');
+    assert.deepEqual(JSON.parse(calls[0][1].body), payload);
   } finally {
     global.fetch = originalFetch;
   }

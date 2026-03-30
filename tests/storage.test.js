@@ -40,10 +40,11 @@ test('uploadFileToStorage prepares, uploads, and completes storage object', asyn
   };
   const uploaded = await uploadFileToStorage(client, filePath, {
     ownerNpub: 'npub-owner',
-    accessGroupNpubs: ['npub-group'],
+    accessGroupIds: ['e32a9684-bdfe-4870-967b-8036ac0ad7d3'],
   });
   assert.equal(uploaded.object_id, 'obj-1');
-  assert.deepEqual(calls[0][1].access_group_npubs, ['npub-group']);
+  assert.deepEqual(calls[0][1].access_group_ids, ['e32a9684-bdfe-4870-967b-8036ac0ad7d3']);
+  assert.equal(calls[0][1].owner_group_id, 'e32a9684-bdfe-4870-967b-8036ac0ad7d3');
   assert.equal(calls[1][1], 'obj-1');
   assert.equal(calls[2][1], 'obj-1');
   rmSync(dir, { recursive: true, force: true });
